@@ -3,5 +3,5 @@ name=DirtySepolicy Bypass
 version=v3.0.0
 versionCode=30000
 author=local
-description=Defeats DirtySepolicy v2.0-v2.2. Intercepts /sys/fs/selinux/access, /status, /context and /proc/*/attr/* to hide framework types, mask allow rules, and fix seqno/policyload counters.
+description=Defeats all versions of DirtySepolicy up to v2.2. Intercepts /sys/fs/selinux/access, /status, /context and /proc/*/attr/* to hide framework types, mask allow rules, and fix seqno/policyload counters.
 updateJson=

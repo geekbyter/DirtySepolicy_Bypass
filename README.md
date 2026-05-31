@@ -1,6 +1,6 @@
 # DirtySepolicy Bypass
 
-Zygisk module that defeats [LSPosed/DirtySepolicy](https://github.com/LSPosed/DirtySepolicy) v2.0–v2.2 and any detector using the same App-Zygote SELinux-probe technique.
+Zygisk module that defeats all versions of [LSPosed/DirtySepolicy](https://github.com/LSPosed/DirtySepolicy) up to v2.2, and any detector using the same App-Zygote SELinux-probe technique.
 
 ## How it works
 
@@ -22,7 +22,7 @@ This module defeats all four vectors:
 | `read` on `/sys/fs/selinux/access` | Parse kernel response, mask hidden permission bits, mask exact-probe bits, rewrite `seqno` to 1 | Defeats `checkSELinuxAccess()` and `avdSeqNo` detection |
 | `read` on `/sys/fs/selinux/status` | Patch `sequence` and `policyload` fields to clean-boot values based on kernel version | Defeats `readStatus()` policy-reload detection |
 | `write` on `/sys/fs/selinux/context` and `/proc/self/attr/current` | Return `EINVAL` for writes containing hidden type substrings | Defeats `contextExists()` first and last checks |
-| `selinux_check_access` / `security_compute_av` | Same logic via libselinux API (defense-in-depth for older detectors) | Defeats v2.0/v2.1 and any libselinux-based detector |
+| `selinux_check_access` / `security_compute_av` | Same logic via libselinux API (defense-in-depth for older detectors) | Defeats v1.x/v2.0/v2.1 and any libselinux-based detector |
 
 All hooks are installed via Zygisk PLT hooking across every loaded `.so` in every app and system_server process.
 
@@ -98,14 +98,28 @@ su -c reboot
 
 ## Verify
 
-1. Run DirtySepolicy — should show "OK: no dirty sepolicy found" with zero warnings.
+1. Open the DirtySepolicy app. It displays the device fingerprint and kernel
+   version at the top, then the detection result in the center. A successful
+   bypass looks like:
+
+   ```
+   OK: no dirty sepolicy found
+   INFO: sequence=0 policyload=0
+   ```
+
+   The expected counter values depend on kernel version:
+   - Kernel < 6.10: `sequence=0 policyload=0`
+   - Kernel >= 6.10: `sequence=4 policyload=1`
+
+   Any `WARNING:` line (e.g. `found Magisk`, `found KernelSU`,
+   `sequence=7 policyload=2`) means a detection vector is leaking.
 
 2. Check hook logs:
    ```sh
    su -c "logcat -d -s DirtySepBypass"
    ```
 
-3. Run the audit tool:
+3. Run the audit tool (reads raw kernel state, compares against hook tables):
    ```sh
    su -c "python3 tools/audit.py"
    ```

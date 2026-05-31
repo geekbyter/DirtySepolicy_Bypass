@@ -1,55 +1,153 @@
 #!/usr/bin/env python3
 """
-SELinux detection-surface audit.
+SELinux detection-surface audit for DirtySepolicy v2.0–v2.2.
 
-Enumerates every SELinux signal on this device that a current or future
-detector (DirtySepolicy-style: probes via SELinux.checkSELinuxAccess or
-direct kernel file writes from inside app_zygote) could use to catch
-your root/hooking framework, and reports whether the installed Zygisk
-bypass module hides each one.
+Mirrors every probe that DirtySepolicy's AppZygote.doCheck() performs,
+using the same kernel interfaces (direct selinuxfs I/O), and reports
+whether the bypass module's hook tables would mask each one.
+
+Run with root:  su -c "python3 tools/audit.py"
 
 Output columns:
-  PROBE           — human label
-  RULE-EXISTS     — does the kernel's loaded policy say "allowed=true"?
-  HOOK-HIDES      — would our module's hooks mask this probe?
-  STATUS          — BLOCKED / LEAK / absent
+  RAW       — what the kernel returns without Zygisk hooks
+  HOOK      — would the bypass module's tables mask this?
+  STATUS    — BLOCKED / LEAK / absent
 
-LEAK means: rule present in the kernel + hook does NOT match — a detector
-hardcoding this probe would catch you. Each LEAK is an action item.
+LEAK means the kernel confirms the probe exists AND the hook would NOT
+mask it — a detector hardcoding this probe would catch you.
 """
 
-import ctypes
 import os
 import re
+import struct
 import sys
 
-# ---------- libselinux ----------------------------------------------------
+# ---------- kernel selinuxfs I/O (mirrors DirtySepolicy v2.2) ---------------
 
-LIBSEL = ctypes.CDLL("/system/lib64/libselinux.so")
-LIBSEL.selinux_check_access.argtypes = [
-    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
-    ctypes.c_char_p, ctypes.c_void_p,
-]
-LIBSEL.selinux_check_access.restype = ctypes.c_int
-
-LIBSEL.security_check_context.argtypes = [ctypes.c_char_p]
-LIBSEL.security_check_context.restype = ctypes.c_int
+SELINUXFS = "/sys/fs/selinux"
 
 
-def kernel_allows(scon, tcon, tclass, perm):
-    """Returns True iff the loaded SELinux policy allows scon->tcon for tclass/perm."""
-    return LIBSEL.selinux_check_access(
-        scon.encode(), tcon.encode(),
-        tclass.encode(), perm.encode(), None,
-    ) == 0
+def read_index(class_name, perm_name):
+    class_path = f"{SELINUXFS}/class/{class_name}/index"
+    perm_path = f"{SELINUXFS}/class/{class_name}/perms/{perm_name}"
+    try:
+        with open(class_path) as f:
+            class_id = int(f.read().strip())
+        with open(perm_path) as f:
+            perm_bit = 1 << (int(f.read().strip()) - 1)
+        return class_id, perm_bit
+    except (FileNotFoundError, ValueError):
+        return None, None
+
+
+def kernel_access(scon, tcon, tclass_id):
+    query = f"{scon} {tcon} {tclass_id}"
+    try:
+        fd = os.open(f"{SELINUXFS}/access", os.O_RDWR)
+        try:
+            os.write(fd, query.encode())
+            resp = os.read(fd, 64).decode()
+        finally:
+            os.close(fd)
+        parts = resp.split()
+        if len(parts) != 6:
+            return None
+        return parts
+    except OSError:
+        return None
+
+
+def check_selinux_access(scon, tcon, tclass, perm):
+    class_id, perm_bit = read_index(tclass, perm)
+    if class_id is None:
+        return False
+    parts = kernel_access(scon, tcon, class_id)
+    if parts is None:
+        return False
+    allowed = int(parts[0], 16)
+    return (allowed & perm_bit) == perm_bit
 
 
 def context_exists(context):
-    """Returns True iff the SELinux context type exists in the loaded policy."""
-    return LIBSEL.security_check_context(context.encode()) == 0
+    # Method 1: /sys/fs/selinux/context (same as SELinux.contextExists)
+    try:
+        fd = os.open(f"{SELINUXFS}/context", os.O_WRONLY)
+        try:
+            os.write(fd, context.encode())
+            return True
+        except OSError as e:
+            if e.errno != 22:  # EINVAL
+                raise
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+    # Method 2: write as scon+tcon to access with tclass=0
+    try:
+        fd = os.open(f"{SELINUXFS}/access", os.O_RDWR)
+        try:
+            os.write(fd, f"{context} {context} 0".encode())
+            os.read(fd, 64)
+            return True
+        except OSError as e:
+            if e.errno != 22:
+                raise
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+    # Method 3: /proc/self/attr/current
+    try:
+        fd = os.open("/proc/self/attr/current", os.O_WRONLY)
+        try:
+            os.write(fd, context.encode())
+            return True
+        except OSError as e:
+            if e.errno == 22:   # EINVAL — context unknown
+                return False
+            if e.errno == 1:    # EPERM — context valid, transition denied
+                return True
+            raise
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+    return False
 
 
-# ---------- module blocklist (must match jni/module.cpp kHidden[]) --------
+def read_status():
+    try:
+        with open(f"{SELINUXFS}/status", "rb") as f:
+            data = f.read(20)
+        if len(data) < 20:
+            return None
+        return struct.unpack("=IIIII", data)
+    except OSError:
+        return None
+
+
+def read_avd_seqno():
+    parts = kernel_access("u:r:untrusted_app:s0", "u:r:untrusted_app:s0", 0)
+    if parts is None or len(parts) < 5:
+        return None
+    return int(parts[4])
+
+
+def detect_kernel():
+    release = os.uname().release
+    parts = release.split(".")
+    try:
+        major, minor = int(parts[0]), int(parts[1].split("-")[0])
+    except (IndexError, ValueError):
+        major, minor = 0, 0
+    new = major > 6 or (major == 6 and minor >= 10)
+    return release, new
+
+
+# ---------- bypass module tables (must match jni/module.cpp) ----------------
 
 HOOK_BLOCKLIST = [
     ":magisk", ":kitsune", ":apatch",
@@ -60,10 +158,7 @@ HOOK_BLOCKLIST = [
     ":zygisk",
 ]
 
-
-HOOK_HIDDEN_PERMS = [
-    "execmem",
-]
+HOOK_HIDDEN_PERMS = ["execmem"]
 
 HOOK_EXACT_PROBES = [
     ("u:object_r:rootfs:s0", "u:object_r:tmpfs:s0", "filesystem", "associate"),
@@ -76,7 +171,6 @@ HOOK_EXACT_PROBES = [
 
 
 def hook_would_hide(scon, tcon, tclass=None, perm=None):
-    """Mirrors is_hidden() + is_hidden_perm() + is_hidden_exact() in jni/module.cpp."""
     for s in HOOK_BLOCKLIST:
         if s in scon or s in tcon:
             return True
@@ -90,94 +184,75 @@ def hook_would_hide(scon, tcon, tclass=None, perm=None):
 
 
 def hook_would_hide_context(context):
-    """Mirrors is_hidden() check on context strings written to kernel files."""
     for s in HOOK_BLOCKLIST:
         if s in context:
             return True
     return False
 
 
-# ---------- known probe surface ------------------------------------------
+# ---------- probe definitions (mirrors AppZygote.doCheck) -------------------
 
-# (label, scon, tcon, tclass, perm)
-KNOWN_ACCESS_PROBES = [
-    # --- current DirtySepolicy v2.0 probes ---
-    ("v2 : system_server execmem", "u:r:system_server:s0", "u:r:system_server:s0", "process", "execmem"),
-    ("v2 : AOSP-su transition",    "u:r:shell:s0",         "u:r:su:s0",            "process", "transition"),
-    ("v2 : adb_root binder",       "u:r:adbd:s0",          "u:r:adbroot:s0",       "binder",  "call"),
-    ("v2 : Magisk file read",      "u:r:untrusted_app:s0", "u:object_r:magisk_file:s0", "file", "read"),
-    ("v2 : Magisk rootfs→tmpfs",   "u:object_r:rootfs:s0", "u:object_r:tmpfs:s0",  "filesystem", "associate"),
-    ("v2 : Magisk kernel→tmpfs",   "u:r:kernel:s0",        "u:object_r:tmpfs:s0",  "fifo_file", "open"),
-    ("v2 : KSU kernel→adb_data",   "u:r:kernel:s0",        "u:object_r:adb_data_file:s0", "file", "read"),
-    ("v2 : KSU file read",         "u:r:untrusted_app:s0", "u:object_r:ksu_file:s0", "file", "read"),
-    ("v2 : LSPosed file read",     "u:r:untrusted_app:s0", "u:object_r:lsposed_file:s0", "file", "read"),
-    ("v2 : LSPosed apk execute",   "u:r:system_server:s0", "u:object_r:apk_data_file:s0", "file", "execute"),
-    ("v2 : Xposed data read",      "u:r:untrusted_app:s0", "u:object_r:xposed_data:s0", "file", "read"),
-    ("v2 : Xposed dex2oat exec",   "u:r:dex2oat:s0",       "u:object_r:dex2oat_exec:s0", "file", "execute_no_trans"),
-    ("v2 : ZygiskNext dir search",  "u:r:zygote:s0",       "u:object_r:adb_data_file:s0", "dir", "search"),
-
-    # --- plausible future probes ---
-    ("future : magisk32 binder",      "u:r:untrusted_app:s0", "u:r:magisk32:s0",               "binder", "call"),
-    ("future : magisk_log_file read", "u:r:untrusted_app:s0", "u:object_r:magisk_log_file:s0", "file",   "read"),
-    ("future : APatch binder",        "u:r:untrusted_app:s0", "u:r:apatch:s0",                 "binder", "call"),
-    ("future : KitsuneMask binder",   "u:r:untrusted_app:s0", "u:r:kitsune:s0",                "binder", "call"),
-    ("future : Riru file",            "u:r:untrusted_app:s0", "u:object_r:riru_file:s0",       "file",   "read"),
-    ("future : SuperSU binder",       "u:r:untrusted_app:s0", "u:r:supersu:s0",                "binder", "call"),
-    ("future : Zygisk-generic file",  "u:r:untrusted_app:s0", "u:object_r:zygisk_file:s0",     "file",   "read"),
+CONTEXT_PROBES = [
+    ("adbroot",        "u:r:adbroot:s0"),
+    ("magisk",         "u:r:magisk:s0"),
+    ("magisk_file",    "u:object_r:magisk_file:s0"),
+    ("ksu",            "u:r:ksu:s0"),
+    ("ksu_file",       "u:object_r:ksu_file:s0"),
+    ("lsposed_file",   "u:object_r:lsposed_file:s0"),
+    ("xposed_data",    "u:object_r:xposed_data:s0"),
+    ("xposed_file",    "u:object_r:xposed_file:s0"),
 ]
 
-# (label, context) — contextExists() probes from DirtySepolicy v2.0
-KNOWN_CONTEXT_PROBES = [
-    ("v2 ctx : adbroot",       "u:r:adbroot:s0"),
-    ("v2 ctx : magisk",        "u:r:magisk:s0"),
-    ("v2 ctx : magisk_file",   "u:object_r:magisk_file:s0"),
-    ("v2 ctx : ksu",           "u:r:ksu:s0"),
-    ("v2 ctx : ksu_file",      "u:object_r:ksu_file:s0"),
-    ("v2 ctx : lsposed_file",  "u:object_r:lsposed_file:s0"),
-    ("v2 ctx : xposed_data",   "u:object_r:xposed_data:s0"),
-    ("v2 ctx : xposed_file",   "u:object_r:xposed_file:s0"),
+ACCESS_PROBES = [
+    ("system_server execmem",  "u:r:system_server:s0", "u:r:system_server:s0", "process",    "execmem"),
+    ("AOSP su transition",     "u:r:shell:s0",         "u:r:su:s0",            "process",    "transition"),
+    ("Magisk rootfs->tmpfs",   "u:object_r:rootfs:s0", "u:object_r:tmpfs:s0",  "filesystem", "associate"),
+    ("Magisk kernel->tmpfs",   "u:r:kernel:s0",        "u:object_r:tmpfs:s0",  "fifo_file",  "open"),
+    ("KSU kernel->adb_data",   "u:r:kernel:s0",        "u:object_r:adb_data_file:s0", "file", "read"),
+    ("LSPosed apk execute",    "u:r:system_server:s0", "u:object_r:apk_data_file:s0", "file", "execute"),
+    ("Xposed dex2oat exec",    "u:r:dex2oat:s0",       "u:object_r:dex2oat_exec:s0",  "file", "execute_no_trans"),
+    ("ZygiskNext dir search",  "u:r:zygote:s0",        "u:object_r:adb_data_file:s0", "dir",  "search"),
+]
+
+FUTURE_PROBES = [
+    ("magisk32 binder",       "u:r:untrusted_app:s0", "u:r:magisk32:s0",               "binder", "call"),
+    ("magisk_log_file read",  "u:r:untrusted_app:s0", "u:object_r:magisk_log_file:s0", "file",   "read"),
+    ("APatch binder",         "u:r:untrusted_app:s0", "u:r:apatch:s0",                 "binder", "call"),
+    ("KitsuneMask binder",    "u:r:untrusted_app:s0", "u:r:kitsune:s0",                "binder", "call"),
+    ("Riru file",             "u:r:untrusted_app:s0", "u:object_r:riru_file:s0",       "file",   "read"),
+    ("SuperSU binder",        "u:r:untrusted_app:s0", "u:r:supersu:s0",                "binder", "call"),
+    ("Zygisk-generic file",   "u:r:untrusted_app:s0", "u:object_r:zygisk_file:s0",     "file",   "read"),
 ]
 
 
-# ---------- policy type discovery ----------------------------------------
+# ---------- policy binary scan ---------------------------------------------
 
-POLICY = "/sys/fs/selinux/policy"
-
-SUSPICIOUS = [
+SUSPICIOUS_NAMES = [
     "magisk", "ksu", "kernelsu", "lsposed", "xposed", "riru",
     "supersu", "zygisk", "apatch", "shamiko", "kitsune", "adbroot",
     "supolicy", "su_daemon",
 ]
 
-STOCK_FP = {
-    "su",
-}
+STOCK_FP = {"su"}
 
 
-def discover_types():
+def scan_policy_types():
     try:
-        blob = open(POLICY, "rb").read()
+        blob = open(f"{SELINUXFS}/policy", "rb").read()
     except PermissionError:
-        print(f"WARN: cannot read {POLICY} (need root for full enumeration)",
-              file=sys.stderr)
-        return set()
+        return None
     ids = set(m.decode("ascii", errors="ignore")
               for m in re.findall(rb"[A-Za-z_][A-Za-z0-9_]{2,63}", blob))
-    return ids
-
-
-def suspicious_types(ids):
     out = []
-    for tn in sorted(ids):
-        if tn in STOCK_FP:
+    for name in sorted(ids):
+        if name in STOCK_FP:
             continue
-        low = tn.lower()
-        if any(s in low for s in SUSPICIOUS):
-            out.append(tn)
+        if any(s in name.lower() for s in SUSPICIOUS_NAMES):
+            out.append(name)
     return out
 
 
-# ---------- presentation -------------------------------------------------
+# ---------- presentation ---------------------------------------------------
 
 def color(s, c):
     if not sys.stdout.isatty():
@@ -186,95 +261,136 @@ def color(s, c):
     return f"\033[{codes[c]}m{s}\033[0m"
 
 
-def status_of(rule_ok, hook_ok):
-    if rule_ok and hook_ok:
+def status_of(exists, hook_hides):
+    if exists and hook_hides:
         return color("BLOCKED", "green")
-    if rule_ok and not hook_ok:
+    if exists and not hook_hides:
         return color("LEAK", "red")
-    if not rule_ok and hook_ok:
+    if not exists and hook_hides:
         return color("(over-block)", "dim")
     return color("absent", "dim")
 
 
 def main():
-    print("=" * 78)
-    print("SELinux detection-surface audit (DirtySepolicy v2.0)")
-    print("=" * 78)
+    release, new_kernel = detect_kernel()
+
+    print("=" * 72)
+    print("SELinux detection-surface audit (DirtySepolicy v2.0-v2.2)")
+    print(f"kernel {release}  new_kernel={new_kernel}")
+    print("=" * 72)
     print()
 
     leaks = []
 
-    # --- Section 1: context-existence probes ---
-    print(f"{'CONTEXT PROBE':<36} {'EXISTS':<6} {'HOOK':<6} STATUS")
-    print("-" * 78)
-    for label, ctx in KNOWN_CONTEXT_PROBES:
+    # --- context-existence probes ---
+    print(f"{'CONTEXT PROBE':<24} {'RAW':<6} {'HOOK':<6} STATUS")
+    print("-" * 72)
+    for label, ctx in CONTEXT_PROBES:
         exists = context_exists(ctx)
         hides = hook_would_hide_context(ctx)
         st = status_of(exists, hides)
-        print(f"{label:<36} {('yes' if exists else 'no'):<6} "
+        print(f"{label:<24} {('yes' if exists else 'no'):<6} "
               f"{('hide' if hides else '-'):<6} {st}")
         if exists and not hides:
-            leaks.append((label, ctx, None, None, None))
+            leaks.append(("context", label, ctx))
 
-    # --- Section 2: access-check probes ---
+    # --- access-check probes ---
     print()
-    print(f"{'ACCESS PROBE':<36} {'RULE':<6} {'HOOK':<6} STATUS")
-    print("-" * 78)
-    for label, scon, tcon, tclass, perm in KNOWN_ACCESS_PROBES:
-        ok = kernel_allows(scon, tcon, tclass, perm)
-        hk = hook_would_hide(scon, tcon, tclass, perm)
-        st = status_of(ok, hk)
-        print(f"{label:<36} {('yes' if ok else 'no'):<6} "
-              f"{('hide' if hk else '-'):<6} {st}")
-        if ok and not hk:
-            leaks.append((label, scon, tcon, tclass, perm))
+    print(f"{'ACCESS PROBE':<28} {'RAW':<6} {'HOOK':<6} STATUS")
+    print("-" * 72)
+    for probes, tag in [(ACCESS_PROBES, "v2.2"), (FUTURE_PROBES, "future")]:
+        for label, scon, tcon, tclass, perm in probes:
+            exists = check_selinux_access(scon, tcon, tclass, perm)
+            hk = hook_would_hide(scon, tcon, tclass, perm)
+            st = status_of(exists, hk)
+            full = f"{tag}: {label}"
+            print(f"{full:<28} {('yes' if exists else 'no'):<6} "
+                  f"{('hide' if hk else '-'):<6} {st}")
+            if exists and not hk:
+                leaks.append(("access", full,
+                              f"{scon} -> {tcon} [{tclass}:{perm}]"))
 
-    # --- Section 3: type enumeration ---
+    # --- status counters ---
     print()
-    print("Loaded-policy enumeration (suspicious types in /sys/fs/selinux/policy):")
-    print("-" * 78)
-    ids = discover_types()
-    if not ids:
-        print("  (cannot read policy without root -- rerun with: su -c 'python3 ...')")
+    print("Status counters:")
+    print("-" * 72)
+
+    if new_kernel:
+        exp_seq, exp_pload = 4, 1
     else:
-        sus = suspicious_types(ids)
-        if not sus:
-            print("  no framework-shaped types found")
-        else:
-            for tn in sus:
-                covered = any(s.strip(":") in tn for s in HOOK_BLOCKLIST)
-                marker = color("hidden", "green") if covered else color("EXPOSED", "red")
-                print(f"  {tn:<40} {marker}")
+        exp_seq, exp_pload = 0, 0
 
-    # --- Section 4: summary ---
+    status = read_status()
+    if status:
+        version, sequence, enforcing, policyload, deny_unknown = status
+        seq_clean = sequence == exp_seq
+        pload_clean = policyload == exp_pload
+
+        print(f"  version={version}  enforcing={enforcing}  "
+              f"deny_unknown={deny_unknown}")
+        print(f"  sequence    = {sequence:>4}  expect {exp_seq:>4}  "
+              f"hook -> {exp_seq}  "
+              f"{color('clean', 'green') if seq_clean else color('DIRTY (hooked)', 'yellow')}")
+        print(f"  policyload  = {policyload:>4}  expect {exp_pload:>4}  "
+              f"hook -> {exp_pload}  "
+              f"{color('clean', 'green') if pload_clean else color('DIRTY (hooked)', 'yellow')}")
+
+        if not seq_clean or not pload_clean:
+            print(f"  -> bypass patches these to sequence={exp_seq} "
+                  f"policyload={exp_pload}")
+    else:
+        print("  (cannot read /sys/fs/selinux/status)")
+
+    avd_seqno = read_avd_seqno()
+    if avd_seqno is not None:
+        seqno_clean = avd_seqno == 1
+        print(f"  avdSeqNo    = {avd_seqno:>4}  expect    1  "
+              f"hook -> 1  "
+              f"{color('clean', 'green') if seqno_clean else color('DIRTY (hooked)', 'yellow')}")
+        if not seqno_clean:
+            print("  -> bypass patches avdSeqNo to 1")
+    else:
+        print("  (cannot read avdSeqNo)")
+
+    # --- policy binary scan ---
     print()
-    print("=" * 78)
-    print("Summary")
-    print("=" * 78)
+    print("Policy binary scan:")
+    print("-" * 72)
+    sus = scan_policy_types()
+    if sus is None:
+        print("  (cannot read policy — rerun with: su -c 'python3 tools/audit.py')")
+    elif not sus:
+        print("  no framework-injected types found")
+    else:
+        for name in sus:
+            covered = any(s.strip(":") in name for s in HOOK_BLOCKLIST)
+            marker = color("hidden", "green") if covered else color("EXPOSED", "red")
+            print(f"  {name:<40} {marker}")
+            if not covered:
+                leaks.append(("type", name, "not in blocklist"))
+
+    # --- summary ---
+    print()
+    print("=" * 72)
     if leaks:
-        print(f"{color('LEAKS', 'red')}: {len(leaks)} probe(s) the kernel confirms exist")
-        print("        AND our hook would NOT mask. Action: extend the bypass.")
-        for entry in leaks:
-            label = entry[0]
-            print(f"  - {label}")
-            if entry[2]:
-                print(f"      scon={entry[1]}  tcon={entry[2]}")
-                print(f"      tclass={entry[3]}  perm={entry[4]}")
-            else:
-                print(f"      context={entry[1]}")
+        print(f"{color('LEAKS', 'red')}: {len(leaks)} issue(s) a detector could exploit")
+        print()
+        for kind, label, detail in leaks:
+            print(f"  [{kind}] {label}")
+            print(f"         {detail}")
+        print()
+        print("Fix: add missing patterns to kHidden[]/kHiddenExact[] in")
+        print("jni/module.cpp and HOOK_BLOCKLIST/HOOK_EXACT_PROBES here.")
     else:
-        print(color("No leaks among known probes.", "green"))
+        print(color("No leaks. DirtySepolicy should report:", "green"))
+        print(f"  OK: no dirty sepolicy found")
+        print(f"  INFO: sequence={exp_seq} policyload={exp_pload}")
 
     print()
-    print("Notes:")
-    print(" - Context probes test the open/write/close hooks that intercept")
-    print("   writes to /sys/fs/selinux/context and /proc/self/attr/current.")
-    print(" - Access probes test both substring matching and exact-match tables.")
-    print(" - Type enumeration is a FORWARD scan: any *new* probe a future detector")
-    print("   might hardcode against the listed types would need to be added to")
-    print("   the hook blocklist or exact-match table.")
-    print(" - This audit runs in a shell process (no Zygisk hook). To verify the")
-    print("   hook is actually live in app_zygote, run DirtySepolicy itself.")
+    print("Note: this runs without Zygisk hooks (raw kernel state).")
+    print("Status counters marked DIRTY are expected — the bypass module")
+    print("patches them at read time inside app_zygote. Run the")
+    print("DirtySepolicy app to verify the hooks are live.")
 
 
 if __name__ == "__main__":
