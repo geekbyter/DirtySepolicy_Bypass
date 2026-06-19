@@ -27,6 +27,11 @@
 #define LOG_TAG "DirtySepBypass"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
+#ifdef DEBUG
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGD(...) ((void)0)
+#endif
 
 void *operator new   (size_t s)              { return malloc(s); }
 void *operator new[] (size_t s)              { return malloc(s); }
@@ -129,11 +134,11 @@ static bool g_bits_resolved = false;
 
 static bool read_int_file(const char *path, int *out) {
     FILE *f = fopen(path, "re");
-    if (!f) return false;
+    if (!f) { LOGW("read_int_file: fopen(%s) failed: %s", path, strerror(errno)); return false; }
     char buf[32];
     bool ok = fgets(buf, sizeof(buf), f) != nullptr;
     fclose(f);
-    if (!ok) return false;
+    if (!ok) { LOGW("read_int_file: fgets(%s) returned null", path); return false; }
     *out = atoi(buf);
     return true;
 }
@@ -143,11 +148,12 @@ static bool resolve_class_perm(const char *cls, const char *perm,
     char path[256];
     int cid, pid;
     snprintf(path, sizeof(path), "/sys/fs/selinux/class/%s/index", cls);
-    if (!read_int_file(path, &cid)) return false;
+    if (!read_int_file(path, &cid)) { LOGW("resolve_class_perm: failed for %s:%s (class index)", cls, perm); return false; }
     snprintf(path, sizeof(path), "/sys/fs/selinux/class/%s/perms/%s", cls, perm);
-    if (!read_int_file(path, &pid)) return false;
+    if (!read_int_file(path, &pid)) { LOGW("resolve_class_perm: failed for %s:%s (perm bit)", cls, perm); return false; }
     *out_cls = (security_class_t)cid;
     *out_bit = 1u << (pid - 1);
+    LOGD("resolved %s:%s -> class=%u bit=0x%x", cls, perm, cid, *out_bit);
     return true;
 }
 
@@ -174,6 +180,7 @@ static void resolve_hidden_bits() {
     }
 
     g_bits_resolved = true;
+    LOGD("resolve_hidden_bits: %d broad, %d exact", g_hidden_bit_count, g_exact_bit_count);
 }
 
 // ---- kernel version detection -------------------------------------------
@@ -182,10 +189,11 @@ static bool g_new_kernel = false;
 
 static void detect_kernel_version() {
     struct utsname uts;
-    if (uname(&uts) != 0) return;
+    if (uname(&uts) != 0) { LOGW("detect_kernel_version: uname() failed: %s", strerror(errno)); return; }
     int major = 0, minor = 0;
     sscanf(uts.release, "%d.%d", &major, &minor);
     g_new_kernel = (major > 6 || (major == 6 && minor >= 10));
+    LOGD("kernel %s -> %d.%d, new_kernel=%d", uts.release, major, minor, g_new_kernel);
 }
 
 // ---- fd tracking --------------------------------------------------------
@@ -227,7 +235,7 @@ static void track_fd(int fd, FdType type) {
             return;
         }
     }
-    if (g_tracked_count >= MAX_TRACKED) return;
+    if (g_tracked_count >= MAX_TRACKED) { LOGW("track_fd: MAX_TRACKED (%d) exceeded, dropping fd %d", MAX_TRACKED, fd); return; }
     auto *t = &g_tracked[g_tracked_count++];
     t->fd = fd;
     t->type = type;
@@ -277,7 +285,7 @@ static FdType classify_path(const char *path) {
 
 static void parse_access_query(TrackedFd *tfd, const char *query) {
     const char *sp1 = strchr(query, ' ');
-    if (!sp1) return;
+    if (!sp1) { LOGW("parse_access_query: no first space in '%s'", query); return; }
     size_t len = sp1 - query;
     if (len >= sizeof(tfd->scon)) len = sizeof(tfd->scon) - 1;
     memcpy(tfd->scon, query, len);
@@ -285,7 +293,7 @@ static void parse_access_query(TrackedFd *tfd, const char *query) {
 
     const char *p = sp1 + 1;
     const char *sp2 = strchr(p, ' ');
-    if (!sp2) return;
+    if (!sp2) { LOGW("parse_access_query: no second space in '%s'", query); return; }
     len = sp2 - p;
     if (len >= sizeof(tfd->tcon)) len = sizeof(tfd->tcon) - 1;
     memcpy(tfd->tcon, p, len);
@@ -293,6 +301,7 @@ static void parse_access_query(TrackedFd *tfd, const char *query) {
 
     tfd->tclass = (unsigned int)strtoul(sp2 + 1, nullptr, 10);
     tfd->has_query = true;
+    LOGD("access query: scon=%s tcon=%s class=%u", tfd->scon, tfd->tcon, tfd->tclass);
 }
 
 static ssize_t patch_access_response(TrackedFd *tfd, char *buf,
@@ -307,8 +316,11 @@ static ssize_t patch_access_response(TrackedFd *tfd, char *buf,
     unsigned int allowed, decided, auditallow, auditdeny, flags, seqno;
     if (sscanf(tmp, "%x %x %x %x %u %x",
                &allowed, &decided, &auditallow, &auditdeny, &seqno, &flags) != 6) {
+        LOGW("patch_access_response: sscanf failed on '%s'", tmp);
         return ret;
     }
+
+    unsigned int orig_allowed = allowed, orig_auditallow = auditallow;
 
     for (int i = 0; i < g_hidden_bit_count; ++i) {
         if (g_hidden_bits[i].cls_id == (security_class_t)tfd->tclass) {
@@ -326,18 +338,23 @@ static ssize_t patch_access_response(TrackedFd *tfd, char *buf,
         }
     }
 
+    unsigned int orig_seqno = seqno;
     seqno = 1;
+
+    if (allowed != orig_allowed || auditallow != orig_auditallow || orig_seqno != 1)
+        LOGD("patch_access: scon=%s tcon=%s class=%u allowed=0x%x->0x%x auditallow=0x%x->0x%x seqno=%u->1",
+             tfd->scon, tfd->tcon, tfd->tclass, orig_allowed, allowed, orig_auditallow, auditallow, orig_seqno);
 
     int newlen = snprintf(buf, bufsize, "%x %x %x %x %u %x",
                           allowed, decided, auditallow, auditdeny, seqno, flags);
-    if (newlen < 0 || (size_t)newlen >= bufsize) return ret;
+    if (newlen < 0 || (size_t)newlen >= bufsize) { LOGW("patch_access_response: snprintf overflow (%d vs %zu)", newlen, bufsize); return ret; }
     return newlen;
 }
 
 // ---- status patching ----------------------------------------------------
 
 static void patch_status(void *buf, ssize_t len) {
-    if (len < 20) return;
+    if (len < 20) { LOGW("patch_status: buffer too short (%zd < 20)", len); return; }
     auto *p = (unsigned char *)buf;
     unsigned int seq, pload;
     if (g_new_kernel) {
@@ -345,8 +362,12 @@ static void patch_status(void *buf, ssize_t len) {
     } else {
         seq = 0;  pload = 0;
     }
+    unsigned int raw_seq, raw_pload;
+    memcpy(&raw_seq, p + 4, sizeof(raw_seq));
+    memcpy(&raw_pload, p + 12, sizeof(raw_pload));
     memcpy(p + 4,  &seq,   sizeof(seq));
     memcpy(p + 12, &pload, sizeof(pload));
+    LOGD("patch_status: seq=%u->%u policyload=%u->%u", raw_seq, seq, raw_pload, pload);
 }
 
 // ---- libselinux ABI (defense-in-depth hooks) ----------------------------
@@ -408,15 +429,21 @@ static int my_security_compute_av(const char *scon, const char *tcon,
                                   access_vector_t requested,
                                   av_decision *avd) {
     if (is_hidden(scon) || is_hidden(tcon)) {
+        LOGD("compute_av: fake deny for hidden scon=%s tcon=%s", scon ? scon : "(null)", tcon ? tcon : "(null)");
         fake_deny(avd);
         return 0;
     }
-    if (!orig_security_compute_av) { errno = ENOSYS; return -1; }
+    if (!orig_security_compute_av) { LOGW("compute_av: orig is null"); errno = ENOSYS; return -1; }
     int r = orig_security_compute_av(scon, tcon, tclass, requested, avd);
     if (r == 0) {
+        unsigned int pre = avd ? avd->allowed : 0;
         mask_hidden_bits(tclass, avd);
         mask_exact_bits(scon, tcon, tclass, avd);
-        if (avd) avd->seqno = 1;
+        if (avd) {
+            if (avd->allowed != pre)
+                LOGD("compute_av: masked scon=%s tcon=%s class=%u allowed=0x%x->0x%x", scon, tcon, tclass, pre, avd->allowed);
+            avd->seqno = 1;
+        }
     }
     return r;
 }
@@ -426,15 +453,21 @@ static int my_security_compute_av_flags(const char *scon, const char *tcon,
                                         access_vector_t requested,
                                         av_decision *avd) {
     if (is_hidden(scon) || is_hidden(tcon)) {
+        LOGD("compute_av_flags: fake deny for hidden scon=%s tcon=%s", scon ? scon : "(null)", tcon ? tcon : "(null)");
         fake_deny(avd);
         return 0;
     }
-    if (!orig_security_compute_av_flags) { errno = ENOSYS; return -1; }
+    if (!orig_security_compute_av_flags) { LOGW("compute_av_flags: orig is null"); errno = ENOSYS; return -1; }
     int r = orig_security_compute_av_flags(scon, tcon, tclass, requested, avd);
     if (r == 0) {
+        unsigned int pre = avd ? avd->allowed : 0;
         mask_hidden_bits(tclass, avd);
         mask_exact_bits(scon, tcon, tclass, avd);
-        if (avd) avd->seqno = 1;
+        if (avd) {
+            if (avd->allowed != pre)
+                LOGD("compute_av_flags: masked scon=%s tcon=%s class=%u allowed=0x%x->0x%x", scon, tcon, tclass, pre, avd->allowed);
+            avd->seqno = 1;
+        }
     }
     return r;
 }
@@ -444,11 +477,13 @@ static int my_selinux_check_access(const char *scon, const char *tcon,
                                    void *auditdata) {
     if (is_hidden(scon) || is_hidden(tcon) || is_hidden_perm(perm) ||
         is_hidden_exact(scon, tcon, tclass, perm)) {
+        LOGD("check_access: denied %s -> %s [%s:%s]", scon ? scon : "(null)", tcon ? tcon : "(null)", tclass ? tclass : "(null)", perm ? perm : "(null)");
         errno = EACCES;
         return -1;
     }
     if (orig_selinux_check_access)
         return orig_selinux_check_access(scon, tcon, tclass, perm, auditdata);
+    LOGW("check_access: orig is null");
     errno = ENOSYS;
     return -1;
 }
@@ -462,12 +497,23 @@ static ssize_t (*orig_read)(int, void *, size_t) = nullptr;
 static ssize_t (*orig_pread64)(int, void *, size_t, off64_t) = nullptr;
 static int     (*orig_close)(int) = nullptr;
 
+static const char *fdtype_str(FdType t) {
+    switch (t) {
+        case FD_CONTEXT: return "context";
+        case FD_ACCESS:  return "access";
+        case FD_STATUS:  return "status";
+        default:         return "none";
+    }
+}
+
 static int my_open(const char *pathname, int flags, mode_t mode) {
     int fd = orig_open ? orig_open(pathname, flags, mode) : -1;
     if (fd >= 0) {
         FdType type = classify_path(pathname);
-        if (type != FD_NONE)
+        if (type != FD_NONE) {
             track_fd(fd, type);
+            LOGD("open: tracking fd=%d type=%s path=%s", fd, fdtype_str(type), pathname);
+        }
     }
     return fd;
 }
@@ -476,8 +522,10 @@ static int my_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
     int fd = orig_openat ? orig_openat(dirfd, pathname, flags, mode) : -1;
     if (fd >= 0) {
         FdType type = classify_path(pathname);
-        if (type != FD_NONE)
+        if (type != FD_NONE) {
             track_fd(fd, type);
+            LOGD("openat: tracking fd=%d type=%s path=%s", fd, fdtype_str(type), pathname);
+        }
     }
     return fd;
 }
@@ -492,6 +540,7 @@ static ssize_t my_write(int fd, const void *buf, size_t count) {
 
             if (tfd->type == FD_CONTEXT || tfd->type == FD_ACCESS) {
                 if (is_hidden(tmp)) {
+                    LOGD("write: blocked hidden context on fd=%d type=%s content='%s'", fd, fdtype_str(tfd->type), tmp);
                     errno = EINVAL;
                     return -1;
                 }
@@ -567,7 +616,7 @@ static int register_against_all_libs(zygisk::Api *api) {
         if (strcmp(path + len - 3, ".so") != 0) continue;
 
         struct stat st;
-        if (stat(path, &st) != 0) continue;
+        if (stat(path, &st) != 0) { LOGD("register: stat(%s) failed: %s", path, strerror(errno)); continue; }
 
         api->pltHookRegister(st.st_dev, st.st_ino, "open",
                              (void *)my_open,   (void **)&orig_open);

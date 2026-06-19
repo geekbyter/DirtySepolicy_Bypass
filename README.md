@@ -84,6 +84,27 @@ aarch64-linux-android-clang++ \
 patchelf --remove-rpath ../module/zygisk/arm64-v8a.so
 ```
 
+### Debug build
+
+Add `-DDEBUG` to get verbose logging (every hook action, blocked write, patched response, internal failures):
+
+```sh
+aarch64-linux-android-clang++ \
+  -std=c++17 -fno-exceptions -fno-rtti \
+  -fPIC -shared -O2 -DDEBUG \
+  -fvisibility=hidden -fvisibility-inlines-hidden \
+  -fdata-sections -ffunction-sections \
+  -nostdlib++ \
+  -Wall -Wextra \
+  -Wl,--hash-style=both \
+  -Wl,--gc-sections \
+  -Wl,-z,lazy \
+  -Wl,-z,norelro \
+  -Wl,-soname,libdirtysepbypass.so \
+  -o ../module/zygisk/arm64-v8a.so \
+  module.cpp -llog
+```
+
 Package the flashable zip:
 
 ```sh
@@ -129,6 +150,18 @@ su -c reboot
    ```sh
    su -c "python3 tools/audit.py"
    ```
+
+## Troubleshooting
+
+If the bypass isn't working on your device, install the debug build (`dirtysepbypass-debug.zip` from [Releases](../../releases)) instead of the regular one. It logs every hook action, blocked write, patched response, and internal failure. After rebooting, open DirtySepolicy, then dump the logs:
+
+```sh
+su -c "logcat -d -s DirtySepBypass" > debug_logs.txt
+```
+
+If you're building from source, add `-DDEBUG` to the compile command (see [Debug build](#debug-build)).
+
+**Please include debug logs when opening an issue** — without them there's no way to diagnose what's happening on your device.
 
 ## Extending the bypass
 
