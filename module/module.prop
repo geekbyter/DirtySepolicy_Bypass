@@ -3,5 +3,5 @@ name=DirtySepolicy Bypass (DuckDetector Enhanced)
 version=v3.1.0-duckdetector
 versionCode=31000
 author=local
-description=Defeats DirtySepolicy v2.0-v2.2 AND DuckDetector dirty sepolicy detection. Extended exact-match probes for shell->su transition, system_server execmem, MSD daemon rules, and Droidspaces rules.
+description=Defeats DirtySepolicy v2.0-v2.2 AND DuckDetector dirty sepolicy detection. Extended exact-match probes for shell->su, execmem, MSD, Droidspaces. Added mmap hook for /sys/fs/selinux/status page patching (covers carrier mmap path).
 updateJson=
