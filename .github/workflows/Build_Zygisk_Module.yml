@@ -1,0 +1,49 @@
+name: Build Zygisk Module
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Build native library
+        run: |
+          cd jni
+          $ANDROID_NDK_HOME/ndk-build \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=Android.mk \
+            APP_ABI=arm64-v8a \
+            APP_PLATFORM=android-29 \
+            APP_STL=c++_static \
+            -j$(nproc)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+
+      - name: Copy .so to module
+        run: |
+          mkdir -p module/zygisk
+          cp libs/arm64-v8a/libdirtysepbypass.so module/zygisk/arm64-v8a.so
+          ls -la module/zygisk/
+
+      - name: Package flashable zip
+        run: |
+          cd module
+          zip -r9 ../dirtysepbypass-duckdetector.zip \
+            module.prop customize.sh META-INF zygisk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirtysepbypass-duckdetector
+          path: dirtysepbypass-duckdetector.zip
+          retention-days: 30
