@@ -70,12 +70,26 @@ struct ExactProbe {
 };
 
 static const ExactProbe kHiddenExact[] = {
+    // --- Original 6 probes (LSPosed/DirtySepolicy v2.0-v2.2) ---
     {"u:object_r:rootfs:s0", "u:object_r:tmpfs:s0", "filesystem", "associate"},
     {"u:r:kernel:s0",        "u:object_r:tmpfs:s0", "fifo_file",  "open"},
     {"u:r:kernel:s0",        "u:object_r:adb_data_file:s0", "file", "read"},
     {"u:r:system_server:s0", "u:object_r:apk_data_file:s0", "file", "execute"},
     {"u:r:dex2oat:s0",       "u:object_r:dex2oat_exec:s0",  "file", "execute_no_trans"},
     {"u:r:zygote:s0",        "u:object_r:adb_data_file:s0", "dir",  "search"},
+    // --- DuckDetector: shell -> su transition (Magisk-injected, uses stock AOSP contexts) ---
+    {"u:r:shell:s0",         "u:r:su:s0",                   "process", "transition"},
+    // --- DuckDetector: system_server execmem (Zygisk/Magisk-injected) ---
+    {"u:r:system_server:s0", "u:r:system_server:s0",        "process", "execmem"},
+    // --- DuckDetector: MSD daemon rules (stock contexts, injected allow rules) ---
+    {"u:r:msd_app:s0",       "u:r:msd_daemon:s0",           "unix_stream_socket", "connectto"},
+    {"u:r:msd_daemon:s0",    "u:r:msd_daemon:s0",           "unix_stream_socket", "connectto"},
+    {"u:r:msd_daemon:s0",    "u:object_r:selinuxfs:s0",     "file", "read"},
+    {"u:r:msd_daemon:s0",    "u:object_r:configfs:s0",      "dir",  "search"},
+    {"u:r:msd_daemon:s0",    "u:object_r:configfs:s0",      "file", "write"},
+    // --- DuckDetector: Droidspaces rules (stock contexts, injected allow rules) ---
+    {"u:r:su:s0",            "u:r:droidspacesd:s0",         "process", "transition"},
+    {"u:r:system_server:s0", "u:r:droidspacesd:s0",         "binder",  "call"},
     {nullptr, nullptr, nullptr, nullptr},
 };
 
@@ -127,7 +141,7 @@ struct ExactBit {
     security_class_t cls_id;
     access_vector_t  perm_bit;
 };
-static ExactBit g_exact_bits[16] = {};
+static ExactBit g_exact_bits[24] = {};
 static int      g_exact_bit_count = 0;
 
 static bool g_bits_resolved = false;
@@ -168,7 +182,7 @@ static void resolve_hidden_bits() {
             g_hidden_bits[g_hidden_bit_count++] = { cid, pbit };
         }
     }
-    for (int i = 0; kHiddenExact[i].scon && g_exact_bit_count < 16; ++i) {
+    for (int i = 0; kHiddenExact[i].scon && g_exact_bit_count < 24; ++i) {
         security_class_t cid;
         access_vector_t pbit;
         if (resolve_class_perm(kHiddenExact[i].tclass, kHiddenExact[i].perm,
