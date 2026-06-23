@@ -31,14 +31,30 @@
 #include <kputils.h>
 
 #ifndef DIRTYDUCK_VERSION
-#define DIRTYDUCK_VERSION "0.1.2"
+#define DIRTYDUCK_VERSION "0.1.4"
+#endif
+
+#ifndef DIRTYDUCK_FAST_INIT
+#define DIRTYDUCK_FAST_INIT 0
+#endif
+
+#ifndef DIRTYDUCK_AUTO_CLEAN_SNAPSHOT
+#define DIRTYDUCK_AUTO_CLEAN_SNAPSHOT 1
+#endif
+
+#ifndef DIRTYDUCK_ALLOW_SLOW_SYMBOL_WALK
+#define DIRTYDUCK_ALLOW_SLOW_SYMBOL_WALK 0
+#endif
+
+#ifndef DIRTYDUCK_PREFER_WRITE_OP_TABLE
+#define DIRTYDUCK_PREFER_WRITE_OP_TABLE 1
 #endif
 
 KPM_NAME("dirtysepolicy_duck_kpm");
 KPM_VERSION(DIRTYDUCK_VERSION);
 KPM_LICENSE("GPLv3");
-KPM_AUTHOR("local+Admire");
-KPM_DESCRIPTION("Hide DirtySepolicy/DuckDetector SELinux access/status probes");
+KPM_AUTHOR("geekbyte");
+KPM_DESCRIPTION("Optimized DirtySepolicy/DuckDetector SELinux access/status filter");
 
 #define ACCESS_SAMPLE_MAX 256
 #define ACCESS_PROBE_SLOTS 32
@@ -58,6 +74,7 @@ KPM_DESCRIPTION("Hide DirtySepolicy/DuckDetector SELinux access/status probes");
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
+#define PROCATTR_AUDIT_LOG_LIMIT 32
 
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
 
@@ -425,11 +442,15 @@ static size_t g_policydb_offset;
 static u32 g_clean_eval_depth;
 static u32 g_bypass_access_log_count;
 static u32 g_bypass_context_log_count;
+static bool g_clean_policy_snapshot_deferred;
+#if DIRTYDUCK_FAST_INIT && !DIRTYDUCK_AUTO_CLEAN_SNAPSHOT
+static u32 g_clean_policy_defer_log_count;
+#endif
 
 /* Cached vmalloc copy of g_clean_policy_blob shared by every reader.
- * Snapshot runs once at module init, so the source pointer is effectively
- * immutable — the cache is reused on every hit and only re-vmalloc'd when
- * the source pointer changes.  Guarded by g_policy_cache_lock. */
+ * In fast-init builds the source pointer may be created later by an explicit
+ * control warm-up. The cache is reused on every hit and only re-vmalloc'd when
+ * the source pointer changes. Guarded by g_policy_cache_lock. */
 static void *g_policy_read_cache;
 static size_t g_policy_read_cache_len;
 static void *g_policy_read_cache_src;
@@ -488,6 +509,8 @@ static bool legacy_clean_query_should_block(const char *query, size_t len, bool 
 static bool legacy_should_block_access_query(const char *query, size_t len);
 static int clean_policy_context_to_sid(const char *query, u32 *out_sid);
 static void refresh_clean_policydb(const char *reason, bool allow_fallback);
+static void snapshot_clean_policy(const char *reason);
+static void maybe_snapshot_clean_policy(const char *reason, bool force);
 static bool should_bypass_clean_filter(uid_t uid);
 static const char *current_comm(void);
 static bool current_is_policy_manager(void);
@@ -768,6 +791,19 @@ static bool str_eq_lit(const char *s, const char *lit)
     return s[i] == '\0';
 }
 
+static size_t bounded_strlen(const char *s, size_t max)
+{
+    size_t i;
+
+    if (!s)
+        return 0;
+
+    for (i = 0; i < max && s[i]; i++) {
+    }
+
+    return i;
+}
+
 static const char *current_comm(void)
 {
     if (task_struct_offset.comm_offset <= 0)
@@ -1007,6 +1043,10 @@ static unsigned long lookup_name_with_suffix(const char *base)
 
     if (!base)
         return 0;
+
+#if !DIRTYDUCK_ALLOW_SLOW_SYMBOL_WALK
+    return 0;
+#endif
 
     for (n = 0; n < 256; n++) {
         for (i = 0; i < sizeof(name) - 1 && base[i]; i++)
@@ -1624,6 +1664,35 @@ load_clean_policy:
     }
 }
 
+static void maybe_snapshot_clean_policy(const char *reason, bool force)
+{
+#if DIRTYDUCK_FAST_INIT && !DIRTYDUCK_AUTO_CLEAN_SNAPSHOT
+    u32 n;
+#endif
+
+    if (force) {
+        WRITE_ONCE(g_clean_policy_snapshot_deferred, false);
+        snapshot_clean_policy(reason);
+        return;
+    }
+
+#if DIRTYDUCK_FAST_INIT && !DIRTYDUCK_AUTO_CLEAN_SNAPSHOT
+    if (READ_ONCE(g_clean_policy_blob) || READ_ONCE(g_dirty_policy_seen))
+        return;
+
+    WRITE_ONCE(g_clean_policy_snapshot_deferred, true);
+    n = READ_ONCE(g_clean_policy_defer_log_count);
+    if (n < 8) {
+        WRITE_ONCE(g_clean_policy_defer_log_count, n + 1);
+        pr_info("[selinux_hook] FAST deferred clean policy snapshot reason=%s; use ctl warm to build baseline\n",
+                reason ?: "(null)");
+    }
+    return;
+#else
+    snapshot_clean_policy(reason);
+#endif
+}
+
 static bool contains_magisk(const char *s, size_t len)
 {
     return contains_case_literal(s, len, "magisk");
@@ -2183,7 +2252,7 @@ static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
 {
     WRITE_ONCE(g_selinux_ready, true);
     selinux_hook_dbg("[selinux_hook] SELinux complete_init done\n");
-    snapshot_clean_policy("complete_init");
+    maybe_snapshot_clean_policy("complete_init", false);
 }
 
 /* Hook: selinux_policy_commit */
@@ -2198,7 +2267,7 @@ static void after_selinux_policy_commit(hook_fargs1_t *a, void *u)
     cancel_clean_sidtab_convert("policy_commit");
     selinux_hook_dbg("[selinux_hook] SELinux policy committed, first policy=%px first policydb=%px clean policydb=%px\n",
                      g_first_policy, g_first_policydb, READ_ONCE(g_clean_policydb));
-    snapshot_clean_policy("policy_commit");
+    maybe_snapshot_clean_policy("policy_commit", false);
 }
 
 static void before_policydb_arg0(hook_fargs6_t *a, void *u)
@@ -2239,7 +2308,7 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
         WRITE_ONCE(g_first_policydb, policydb);
         selinux_hook_dbg("[selinux_hook] SAVED first policydb @ %px\n", g_first_policydb);
         refresh_clean_policydb("first_compute_av", false);
-        snapshot_clean_policy("first_compute_av");
+        maybe_snapshot_clean_policy("first_compute_av", false);
         return;
     }
 
@@ -2331,7 +2400,7 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
         selinux_hook_dbg("[selinux_hook] SELinux ready inferred from legacy context_struct_compute_av\n");
     }
 
-    snapshot_clean_policy("legacy_compute_av");
+    maybe_snapshot_clean_policy("legacy_compute_av", false);
 }
 
 /* Hook: /sys/fs/selinux/access write handler */
@@ -2363,7 +2432,7 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     }
 
     if (!clean_policydb_redirect_supported()) {
-        snapshot_clean_policy("legacy_access");
+        maybe_snapshot_clean_policy("legacy_access", false);
         if (legacy_clean_query_should_block(sample, sample_len, true)) {
             n = READ_ONCE(g_clean_access_count) + 1;
             WRITE_ONCE(g_clean_access_count, n);
@@ -2458,7 +2527,7 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     }
 
     if (!clean_policydb_redirect_supported()) {
-        snapshot_clean_policy("legacy_context");
+        maybe_snapshot_clean_policy("legacy_context", false);
         if (legacy_clean_query_should_block(sample, sample_len, false)) {
             n = READ_ONCE(g_clean_access_count) + 1;
             WRITE_ONCE(g_clean_access_count, n);
@@ -2627,32 +2696,50 @@ static int install_write_op_hooks(void)
     sel_write_op_fn *write_op;
     int rc;
 
-    /* Prefer direct symbol lookup; fall back to LLVM-suffix variant */
-    addr_access = (unsigned long)kallsyms_lookup_name("sel_write_access");
-    if (!addr_access)
-        addr_access = lookup_name_with_suffix("sel_write_access");
+    addr_access = 0;
+    addr_context = 0;
 
-    addr_context = (unsigned long)kallsyms_lookup_name("sel_write_context");
-    if (!addr_context)
-        addr_context = lookup_name_with_suffix("sel_write_context");
+#if DIRTYDUCK_PREFER_WRITE_OP_TABLE
+    /*
+     * On current SuKiSU/GKI builds sel_write_access/context are often not
+     * exported, while the selinuxfs write_op table is.  Trying the missing
+     * symbols first can burn many seconds in suffix lookup, so go straight to
+     * the table path and keep direct hooks only as a fallback.
+     */
+    write_op = (sel_write_op_fn *)kallsyms_lookup_name("write_op");
+    if (!write_op)
+        pr_warn("[selinux_hook] write_op table not found, trying direct sel_write hooks\n");
+#else
+    write_op = NULL;
+#endif
 
-    if (addr_access) {
-        g_funcs[g_hooks++] = (void *)addr_access;
-        hook_wrap((void *)addr_access, 3, before_sel_write_access, after_sel_write_common, NULL);
-        selinux_hook_dbg("[selinux_hook] inline hook sel_write_access @ %lx\n", addr_access);
+    if (!write_op) {
+        addr_access = (unsigned long)kallsyms_lookup_name("sel_write_access");
+        if (!addr_access)
+            addr_access = lookup_name_with_suffix("sel_write_access");
 
-        if (addr_context) {
-            g_funcs[g_hooks++] = (void *)addr_context;
-            hook_wrap((void *)addr_context, 3, before_sel_write_context, after_sel_write_common, NULL);
-            selinux_hook_dbg("[selinux_hook] inline hook sel_write_context @ %lx\n", addr_context);
-        } else {
-            pr_warn("[selinux_hook] sel_write_context not found, context hook skipped\n");
+        addr_context = (unsigned long)kallsyms_lookup_name("sel_write_context");
+        if (!addr_context)
+            addr_context = lookup_name_with_suffix("sel_write_context");
+
+        if (addr_access) {
+            g_funcs[g_hooks++] = (void *)addr_access;
+            hook_wrap((void *)addr_access, 3, before_sel_write_access, after_sel_write_common, NULL);
+            selinux_hook_dbg("[selinux_hook] inline hook sel_write_access @ %lx\n", addr_access);
+
+            if (addr_context) {
+                g_funcs[g_hooks++] = (void *)addr_context;
+                hook_wrap((void *)addr_context, 3, before_sel_write_context, after_sel_write_common, NULL);
+                selinux_hook_dbg("[selinux_hook] inline hook sel_write_context @ %lx\n", addr_context);
+            } else {
+                pr_warn("[selinux_hook] sel_write_context not found, context hook skipped\n");
+            }
+            return 0;
         }
-        return 0;
+
+        write_op = (sel_write_op_fn *)kallsyms_lookup_name("write_op");
     }
 
-    /* Fallback: patch the write_op function pointer table */
-    write_op = (sel_write_op_fn *)kallsyms_lookup_name("write_op");
     if (!write_op) {
         pr_err("[selinux_hook] cannot find sel_write_access or write_op\n");
         return -ENOENT;
@@ -2767,11 +2854,13 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
     n = READ_ONCE(g_procattr_current_count) + 1;
     WRITE_ONCE(g_procattr_current_count, n);
 
-    pr_info("[selinux_hook] AUDIT /proc/self/attr/current #%u hook=%s lsm=%s uid=%d comm=%s name_ptr=%px value=%px size=%zu sample_len=%zu manager=%d clean_checked=%d clean_ret=%d clean_sid=%u clean_policydb=%px action=%s forced_ret=%d query=\"%s\"\n",
-            n, hook ?: "?", lsm ?: "-", uid, current_comm(), name, value, size,
-            sample_len, manager, clean_checked,
-            clean_ret, clean_sid, READ_ONCE(g_clean_policydb),
-            blocked ? "block" : "pass", blocked ? -EINVAL : 0, sample);
+    if (blocked || n <= PROCATTR_AUDIT_LOG_LIMIT) {
+        pr_info("[selinux_hook] AUDIT /proc/self/attr/current #%u hook=%s lsm=%s uid=%d comm=%s name_ptr=%px value=%px size=%zu sample_len=%zu manager=%d clean_checked=%d clean_ret=%d clean_sid=%u clean_policydb=%px action=%s forced_ret=%d query=\"%s\"\n",
+                n, hook ?: "?", lsm ?: "-", uid, current_comm(), name, value, size,
+                sample_len, manager, clean_checked,
+                clean_ret, clean_sid, READ_ONCE(g_clean_policydb),
+                blocked ? "block" : "pass", blocked ? -EINVAL : 0, sample);
+    }
     return blocked;
 }
 
@@ -3324,7 +3413,7 @@ static long init(const char *args, const char *event, void *__user r)
     if (!security_read_policy_fn)
         pr_warn("[selinux_hook] cannot find security_read_policy, clean policy snapshot disabled\n");
     else
-        snapshot_clean_policy("module_init");
+        maybe_snapshot_clean_policy("module_init", false);
     if (!security_context_to_sid_fn)
         pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean policydb query will use blob fallback\n");
     if (!policydb_read_fn || !policydb_destroy_fn)
@@ -3541,24 +3630,36 @@ static long exit_(void *__user r)
     return 0;
 }
 static long control(const char* args, char* __user out_msg, int outlen) {
+    char echo[160] = "";
+    size_t args_len = bounded_strlen(args, 128);
+    bool want_warm = contains_case_lit(args, args_len, "warm", 4);
+    bool want_status = contains_case_lit(args, args_len, "status", 6);
 
-    int rc = 0;
-    char echo[64] = "";
-    if (rc < 0) {
-    sprintf(echo, "error, rc=%d\n", rc);
-        logke("fg_sram_write %s", echo);
-        if (out_msg) {
-            compat_copy_to_user(out_msg, echo, sizeof(echo));
-            return 1;
-        }
+    (void)outlen;
+
+    if (want_warm) {
+        maybe_snapshot_clean_policy("ctl_warm", true);
+        sprintf(echo, "warm done blob=%d len=%u policydb=%d deferred=%d\n",
+                READ_ONCE(g_clean_policy_blob) ? 1 : 0,
+                (unsigned)READ_ONCE(g_clean_policy_len),
+                READ_ONCE(g_clean_policydb) ? 1 : 0,
+                READ_ONCE(g_clean_policy_snapshot_deferred) ? 1 : 0);
+    } else if (want_status) {
+        sprintf(echo, "status version=%s blob=%d len=%u policydb=%d deferred=%d hooks=%d\n",
+                DIRTYDUCK_VERSION,
+                READ_ONCE(g_clean_policy_blob) ? 1 : 0,
+                (unsigned)READ_ONCE(g_clean_policy_len),
+                READ_ONCE(g_clean_policydb) ? 1 : 0,
+                READ_ONCE(g_clean_policy_snapshot_deferred) ? 1 : 0,
+                g_hooks);
     } else {
-        sprintf(echo, "success resp\n");
-        logki("fg_sram_write %s", echo);
-        if (out_msg) {
-            compat_copy_to_user(out_msg, echo, sizeof(echo));
-            return 0;
-        }
+        sprintf(echo, "ok version=%s; ctl warm builds clean-policy baseline\n",
+                DIRTYDUCK_VERSION);
     }
+
+    logki("dirtyduck_ctl %s", echo);
+    if (out_msg)
+        compat_copy_to_user(out_msg, echo, sizeof(echo));
     return 0;
 }
 KPM_INIT(init);

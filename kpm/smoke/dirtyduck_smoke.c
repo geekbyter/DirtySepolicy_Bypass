@@ -9,7 +9,7 @@
 KPM_NAME("dirtyduck_smoke");
 KPM_VERSION(SMOKE_VERSION);
 KPM_LICENSE("GPLv3");
-KPM_AUTHOR("local");
+KPM_AUTHOR("geekbyte");
 KPM_DESCRIPTION("No-op KPM smoke test for SuKiSU/KernelPatch loading");
 
 static long init(const char *args, const char *event, void *__user reserved)

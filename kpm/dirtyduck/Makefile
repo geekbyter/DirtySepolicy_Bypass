@@ -1,4 +1,4 @@
-DIRTYDUCK_VERSION := 0.1.2
+DIRTYDUCK_VERSION := 0.1.4
 
 ifndef KP_DIR
     KP_DIR = ../../../_refs/selinux_hook/KernelPatch

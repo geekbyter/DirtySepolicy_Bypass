@@ -1,5 +1,33 @@
 # DirtySepolicy Bypass
 
+## Fork Notes
+
+This tree starts from [flipphoneguy/DirtySepolicy_Bypass](https://github.com/flipphoneguy/DirtySepolicy_Bypass)
+and keeps the original Zygisk implementation as a fallback/diagnostic path.
+The current working branch adds a SuKiSU/GKI-oriented KernelPatch path:
+
+- `kpm/dirtyduck/`: a kernel-side SELinux access/status/context/procattr filter
+  adapted for DirtySepolicy and DuckDetector probes.
+- `kpm/smoke/`: a no-op KPM used to verify that KPM loading is safe before
+  testing the SELinux hook.
+- `module-kpm/`: a safe ordinary loader module; it does not autoload KPM unless
+  explicitly enabled.
+- `tools/build_kpm_windows.ps1` and `tools/package_kpm_loader.ps1`: Windows
+  build/package helpers for the KPM workflow.
+
+Compared with [Admirepowered/selinux_hook](https://github.com/Admirepowered/selinux_hook),
+this branch uses that project as the kernel-hook reference but retargets the
+logic from generic APatch dirty-rule hiding to DirtySepolicy/DuckDetector
+detection surfaces.  It keeps a clean-policy baseline, rewrites SELinux
+access/status/context/procattr query results, adds DuckDetector-specific probe
+patterns, prefers the `write_op` table on SuKiSU/GKI, and disables slow
+compiler-suffix symbol walking by default to reduce KPM load time.
+
+Reference projects:
+
+- [flipphoneguy/DirtySepolicy_Bypass](https://github.com/flipphoneguy/DirtySepolicy_Bypass)
+- [Admirepowered/selinux_hook](https://github.com/Admirepowered/selinux_hook)
+
 ## Current SuKiSU/GKI Direction
 
 For the current SuKiSU/GKI environment, the recommended path is **not** the

@@ -74,7 +74,7 @@ if ($Target -eq "smoke" -or $Target -eq "all") {
 
 if ($Target -eq "dirtyduck" -or $Target -eq "all") {
     $dir = Join-Path $repo "kpm\dirtyduck"
-    $built += Build-Kpm $dir "dirtyduck_selinux.c" "dirtyduck_selinux.o" "dirtyduck_selinux_0.1.2.kpm"
+    $built += Build-Kpm $dir "dirtyduck_selinux.c" "dirtyduck_selinux.o" "dirtyduck_selinux_0.1.4.kpm"
 }
 
 $built | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize

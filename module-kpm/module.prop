@@ -1,7 +1,7 @@
 id=dirtysepbypass_kpm
 name=DirtySepolicy Duck KPM Loader
-version=v0.1.0-safe-loader
-versionCode=100
-author=local
+version=v0.1.2-optimized-loader
+versionCode=102
+author=geekbyte
 description=Safe SuKiSU/KernelPatch loader shell for DirtySepolicy/DuckDetector KPM. Does not autoload by default.
 updateJson=

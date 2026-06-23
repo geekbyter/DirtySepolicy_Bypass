@@ -12,7 +12,8 @@ echo "Manual test order:"
 echo "  1. Load smoke KPM from SuKiSU/APatch manager."
 echo "  2. Check dmesg for [dirtyduck_smoke]."
 echo "  3. Load dirtyduck_selinux KPM manually."
-echo "  4. Only after success: touch $STATE_DIR/enable-autoload"
+echo "  4. Optional: run KPM ctl status/warm from the manager if full clean-policy baseline is needed."
+echo "  5. Only after success: touch $STATE_DIR/enable-autoload"
 echo
 echo "Module files:"
 ls -l "$MODDIR/kpm" 2>/dev/null || true
