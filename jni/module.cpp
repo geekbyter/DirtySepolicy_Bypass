@@ -513,6 +513,7 @@ static ssize_t (*orig_pread64)(int, void *, size_t, off64_t) = nullptr;
 static int     (*orig_close)(int) = nullptr;
 static void   *(*orig_mmap)(void *, size_t, int, int, int, off_t) = nullptr;
 
+#ifdef DEBUG
 static const char *fdtype_str(FdType t) {
     switch (t) {
         case FD_CONTEXT: return "context";
@@ -521,6 +522,7 @@ static const char *fdtype_str(FdType t) {
         default:         return "none";
     }
 }
+#endif
 
 static int my_open(const char *pathname, int flags, mode_t mode) {
     int fd = orig_open ? orig_open(pathname, flags, mode) : -1;
