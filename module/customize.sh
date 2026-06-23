@@ -22,7 +22,7 @@ if [ "$ZYGISK_ENABLED" != "true" ] && [ "$ZYGISK_ENABLED" != "1" ]; then
   fi
 fi
 
-ui_print "- Installing DirtySepolicy Bypass v3.2.0-duckdetector"
+ui_print "- Installing DirtySepolicy Bypass v4.0.0-got-patch"
 ui_print "- ABI: $ARCH ($IS64BIT-bit)"
 
 # Magisk auto-extracts $ZIPFILE into $MODPATH. Confirm the zygisk payload

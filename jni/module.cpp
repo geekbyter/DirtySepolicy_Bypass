@@ -17,8 +17,11 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <elf.h>
+#include <link.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/mman.h>
 #include <sys/utsname.h>
 
 #include <android/log.h>
@@ -612,10 +615,135 @@ static int my_close(int fd) {
     return orig_close ? orig_close(fd) : -1;
 }
 
-// ---- map walking --------------------------------------------------------
+// ---- manual GOT/PLT patching (bypasses pltHookCommit) -------------------
+// SuKiSu/KernelSU Zygisk does not implement pltHookCommit.
+// We patch GOT entries directly using mprotect + pointer swap.
 
-// Only hook libs that are relevant to SELinux detection. Hooking every .so
-// (1000+) causes pltHookCommit to fail on resource-constrained devices.
+struct HookEntry {
+    const char *symbol;
+    void       *newFunc;
+    void      **origFunc;
+};
+
+static const HookEntry g_libc_hooks[] = {
+    { "open",               (void *)my_open,                (void **)&orig_open },
+    { "openat",             (void *)my_openat,              (void **)&orig_openat },
+    { "write",              (void *)my_write,               (void **)&orig_write },
+    { "read",               (void *)my_read,                (void **)&orig_read },
+    { "pread64",            (void *)my_pread64,             (void **)&orig_pread64 },
+    { "close",              (void *)my_close,               (void **)&orig_close },
+    { nullptr, nullptr, nullptr },
+};
+
+static const HookEntry g_selinux_hooks[] = {
+    { "security_compute_av",       (void *)my_security_compute_av,       (void **)&orig_security_compute_av },
+    { "security_compute_av_flags", (void *)my_security_compute_av_flags, (void **)&orig_security_compute_av_flags },
+    { "selinux_check_access",      (void *)my_selinux_check_access,      (void **)&orig_selinux_check_access },
+    { nullptr, nullptr, nullptr },
+};
+
+static bool patch_got(void *base, const ElfW(Dyn) *dynamic,
+                      const HookEntry *hooks) {
+    const ElfW(Sym)  *symtab  = nullptr;
+    const char       *strtab  = nullptr;
+    ElfW(Addr)       *got     = nullptr;
+    size_t            got_size = 0;
+    ElfW(Addr)       *gnu_hash = nullptr;
+    ElfW(Addr)       *hash     = nullptr;
+
+    for (auto *d = dynamic; d->d_tag != DT_NULL; ++d) {
+        switch (d->d_tag) {
+            case DT_SYMTAB:  symtab  = (const ElfW(Sym) *)d->d_un.d_ptr; break;
+            case DT_STRTAB:  strtab  = (const char *)d->d_un.d_ptr;      break;
+            case DT_PLTGOT:  got     = (ElfW(Addr) *)d->d_un.d_ptr;      break;
+            case DT_PLTRELSZ:got_size= d->d_un.d_val / sizeof(ElfW(Addr)); break;
+            case DT_GNU_HASH:gnu_hash= (ElfW(Addr) *)d->d_un.d_ptr;      break;
+            case DT_HASH:    hash    = (ElfW(Addr) *)d->d_un.d_ptr;      break;
+        }
+    }
+    if (!symtab || !strtab || !got || !got_size) return false;
+
+    // GOT[0] = _DYNAMIC, GOT[1] = link_map, GOT[2] = dlresolve
+    // Real entries start at GOT[3]
+    int hooked = 0;
+    for (const HookEntry *h = hooks; h->symbol; ++h) {
+        void *orig = dlsym(RTLD_DEFAULT, h->symbol);
+        if (!orig) continue;
+        if (!*h->origFunc) *h->origFunc = orig;
+
+        for (size_t i = 3; i < got_size && i < 1024; ++i) {
+            if (got[i] == (ElfW(Addr))orig) {
+                // Make GOT writable
+                uintptr_t page = (uintptr_t)&got[i] & ~(uintptr_t)0xFFF;
+                mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
+                got[i] = (ElfW(Addr))h->newFunc;
+                // Restore read-only
+                mprotect((void *)page, 0x2000, PROT_READ);
+                ++hooked;
+                LOGD("GOT patched: %s @ got[%zu] in %p", h->symbol, i, base);
+                break;
+            }
+        }
+    }
+    return hooked > 0;
+}
+
+static int manual_hook_libs() {
+    FILE *fp = fopen("/proc/self/maps", "re");
+    if (!fp) return 0;
+
+    int n = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        char *path = strchr(line, '/');
+        if (!path) continue;
+        size_t len = strlen(path);
+        if (len < 4) continue;
+        if (path[len - 1] == '\n') { path[len - 1] = '\0'; len--; }
+        if (len < 4) continue;
+        if (strcmp(path + len - 3, ".so") != 0) continue;
+
+        const char *basename = strrchr(path, '/');
+        if (!basename) continue;
+        basename++;
+        if (strcmp(basename, "libc.so") != 0 &&
+            strcmp(basename, "libselinux.so") != 0)
+            continue;
+
+        // Parse ELF base from maps: "start-end perms offset dev inode pathname"
+        uintptr_t base = 0;
+        if (sscanf(line, "%lx-", &base) != 1 || !base) continue;
+
+        auto *ehdr = (ElfW(Ehdr) *)base;
+        if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) continue;
+        if (ehdr->e_type != ET_DYN) continue;
+
+        auto *phdr = (ElfW(Phdr) *)(base + ehdr->e_phoff);
+        const ElfW(Dyn) *dynamic = nullptr;
+        for (size_t i = 0; i < ehdr->e_phnum; ++i) {
+            if (phdr[i].p_type == PT_DYNAMIC) {
+                dynamic = (const ElfW(Dyn) *)(base + phdr[i].p_offset);
+                break;
+            }
+        }
+        if (!dynamic) continue;
+
+        const HookEntry *hooks = nullptr;
+        if (strcmp(basename, "libc.so") == 0)
+            hooks = g_libc_hooks;
+        else if (strcmp(basename, "libselinux.so") == 0)
+            hooks = g_selinux_hooks;
+        if (!hooks) continue;
+
+        if (patch_got((void *)base, dynamic, hooks))
+            ++n;
+    }
+    fclose(fp);
+    return n;
+}
+
+// ---- map walking (legacy, kept for fallback) ----------------------------
+
 static int register_against_all_libs(zygisk::Api *api) {
     FILE *fp = fopen("/proc/self/maps", "re");
     if (!fp) {
@@ -633,23 +761,18 @@ static int register_against_all_libs(zygisk::Api *api) {
         if (len < 4) continue;
         if (strcmp(path + len - 3, ".so") != 0) continue;
 
-        // Only hook libc, libselinux, libandroid_runtime, and the detector's own lib
         const char *basename = strrchr(path, '/');
         if (!basename) continue;
-        basename++; // skip '/'
+        basename++;
         if (strcmp(basename, "libc.so") != 0 &&
             strcmp(basename, "libc_malloc_hooks.so") != 0 &&
-            strcmp(basename, "libselinux.so") != 0 &&
-            strcmp(basename, "libandroid_runtime.so") != 0 &&
-            strstr(basename, "libduckdetector") == nullptr &&
-            strstr(basename, "libdirtysepbypass") == nullptr) {
+            strcmp(basename, "libselinux.so") != 0) {
             continue;
         }
 
         struct stat st;
-        if (stat(path, &st) != 0) { LOGD("register: stat(%s) failed: %s", path, strerror(errno)); continue; }
+        if (stat(path, &st) != 0) continue;
 
-        // libc: hook file I/O functions
         if (strcmp(basename, "libc.so") == 0 ||
             strcmp(basename, "libc_malloc_hooks.so") == 0) {
             api->pltHookRegister(st.st_dev, st.st_ino, "open",
@@ -666,7 +789,6 @@ static int register_against_all_libs(zygisk::Api *api) {
                                  (void *)my_close,  (void **)&orig_close);
         }
 
-        // libselinux: hook security_compute_av and selinux_check_access
         if (strcmp(basename, "libselinux.so") == 0) {
             api->pltHookRegister(st.st_dev, st.st_ino, "security_compute_av",
                                  (void *)my_security_compute_av,
@@ -709,16 +831,25 @@ private:
     void install(const char *who) {
         detect_kernel_version();
         resolve_hidden_bits();
-        int n = register_against_all_libs(api);
-        if (n == 0) {
+
+        // Try manual GOT patching first (works on SuKiSu/KernelSU)
+        int n = manual_hook_libs();
+        if (n > 0) {
+            LOGI("[%s] manual GOT hooks installed on %d libs", who, n);
+            return;
+        }
+
+        // Fallback to Zygisk PLT hooking (works on standard Magisk)
+        int m = register_against_all_libs(api);
+        if (m == 0) {
             LOGW("[%s] no .so libs found to hook", who);
             return;
         }
         if (!api->pltHookCommit()) {
             LOGW("[%s] pltHookCommit failed after registering %d libs",
-                 who, n);
+                 who, m);
         } else {
-            LOGI("[%s] hooks committed across %d libs", who, n);
+            LOGI("[%s] zygisk PLT hooks committed across %d libs", who, m);
         }
     }
 };
