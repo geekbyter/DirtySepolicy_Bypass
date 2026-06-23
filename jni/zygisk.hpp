@@ -1,7 +1,8 @@
 /* Copyright 2022-2023 John "topjohnwu" Wu
  *
  * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted.
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
  *
  * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
  * REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
@@ -25,80 +26,6 @@
 
 #define ZYGISK_API_VERSION 5
 
-/*
-
-***************
-* Introduction
-***************
-
-On Android, all app processes are forked from a special daemon called "Zygote".
-For each new app process, zygote will fork a new process and perform "specialization".
-This specialization operation enforces the Android security sandbox on the newly forked
-process to make sure that 3rd party application code is only loaded after it is being
-restricted within a sandbox.
-
-On Android, there is also this special process called "system_server". This single
-process hosts a significant portion of system services, which controls how the
-Android operating system and apps interact with each other.
-
-The Zygisk framework provides a way to allow developers to build modules and run custom
-code before and after system_server and any app processes' specialization.
-This enable developers to inject code and alter the behavior of system_server and app processes.
-
-Please note that modules will only be loaded after zygote has forked the child process.
-THIS MEANS ALL OF YOUR CODE RUNS IN THE APP/SYSTEM_SERVER PROCESS, NOT THE ZYGOTE DAEMON!
-
-*********************
-* Development Guide
-*********************
-
-Define a class and inherit zygisk::ModuleBase to implement the functionality of your module.
-Use the macro REGISTER_ZYGISK_MODULE(className) to register that class to Zygisk.
-
-Example code:
-
-static jint (*orig_logger_entry_max)(JNIEnv *env);
-static jint my_logger_entry_max(JNIEnv *env) { return orig_logger_entry_max(env); }
-
-class ExampleModule : public zygisk::ModuleBase {
-public:
-    void onLoad(zygisk::Api *api, JNIEnv *env) override {
-        this->api = api;
-        this->env = env;
-    }
-    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        JNINativeMethod methods[] = {
-            { "logger_entry_max_payload_native", "()I", (void*) my_logger_entry_max },
-        };
-        api->hookJniNativeMethods(env, "android/util/Log", methods, 1);
-        *(void **) &orig_logger_entry_max = methods[0].fnPtr;
-    }
-private:
-    zygisk::Api *api;
-    JNIEnv *env;
-};
-
-REGISTER_ZYGISK_MODULE(ExampleModule)
-
------------------------------------------------------------------------------------------
-
-Since your module class's code runs with either Zygote's privilege in pre[XXX]Specialize,
-or runs in the sandbox of the target process in post[XXX]Specialize, the code in your class
-never runs in a true superuser environment.
-
-If your module require access to superuser permissions, you can create and register
-a root companion handler function. This function runs in a separate root companion
-daemon process, and an Unix domain socket is provided to allow you to perform IPC between
-your target process and the root companion process.
-
-Example code:
-
-static void example_handler(int socket) { ... }
-
-REGISTER_ZYGISK_COMPANION(example_handler)
-
-*/
-
 namespace zygisk {
 
 struct Api;
@@ -120,7 +47,6 @@ public:
 };
 
 struct AppSpecializeArgs {
-    // Required arguments. These arguments are guaranteed to exist on all Android versions.
     jint &uid;
     jint &gid;
     jintArray &gids;
@@ -132,7 +58,6 @@ struct AppSpecializeArgs {
     jstring &instruction_set;
     jstring &app_data_dir;
 
-    // Optional arguments. Please check whether the pointer is null before de-referencing
     jintArray *const fds_to_ignore;
     jboolean *const is_child_zygote;
     jboolean *const is_top_app;
@@ -161,13 +86,11 @@ struct api_table;
 template <class T> void entry_impl(api_table *, JNIEnv *);
 }
 
-// These values are used in Api::setOption(Option)
 enum Option : int {
     FORCE_DENYLIST_UNMOUNT = 0,
     DLCLOSE_MODULE_LIBRARY = 1,
 };
 
-// Bit masks of the return value of Api::getFlags()
 enum StateFlag : uint32_t {
     PROCESS_GRANTED_ROOT = (1u << 0),
     PROCESS_ON_DENYLIST = (1u << 1),
@@ -196,18 +119,18 @@ private:
     template <class T> friend void internal::entry_impl(internal::api_table *, JNIEnv *);
 };
 
+// Visibility attribute is required because -fvisibility=hidden in CFLAGS
+// overrides the extern "C" declaration.  The definition must carry the
+// attribute explicitly so dlsym can find the symbol.
 #define REGISTER_ZYGISK_MODULE(clazz) \
+__attribute__((visibility("default"))) \
 void zygisk_module_entry(zygisk::internal::api_table *table, JNIEnv *env) { \
     zygisk::internal::entry_impl<clazz>(table, env);                        \
 }
 
 #define REGISTER_ZYGISK_COMPANION(func) \
+__attribute__((visibility("default"))) \
 void zygisk_companion_entry(int client) { func(client); }
-
-/*********************************************************
- * The following is internal ABI implementation detail.
- * You do not have to understand what it is doing.
- *********************************************************/
 
 namespace internal {
 
@@ -229,7 +152,6 @@ struct module_abi {
 };
 
 struct api_table {
-    // Base
     void *impl;
     bool (*registerModule)(api_table *, module_abi *);
 

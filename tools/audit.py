@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SELinux detection-surface audit for DirtySepolicy v2.0–v2.2.
+SELinux detection-surface audit for DirtySepolicy v2.0–v2.2 (v5.0.0-universal).
 
 Mirrors every probe that DirtySepolicy's AppZygote.doCheck() performs,
 using the same kernel interfaces (direct selinuxfs I/O), and reports
@@ -167,6 +167,18 @@ HOOK_EXACT_PROBES = [
     ("u:r:system_server:s0", "u:object_r:apk_data_file:s0", "file", "execute"),
     ("u:r:dex2oat:s0",       "u:object_r:dex2oat_exec:s0",  "file", "execute_no_trans"),
     ("u:r:zygote:s0",        "u:object_r:adb_data_file:s0", "dir",  "search"),
+    ("u:r:shell:s0",         "u:r:su:s0",                   "process", "transition"),
+    ("u:r:system_server:s0", "u:r:system_server:s0",        "process", "execmem"),
+    ("u:r:msd_app:s0",       "u:r:msd_daemon:s0",           "unix_stream_socket", "connectto"),
+    ("u:r:msd_daemon:s0",    "u:r:msd_daemon:s0",           "unix_stream_socket", "connectto"),
+    ("u:r:msd_daemon:s0",    "u:object_r:selinuxfs:s0",     "file", "read"),
+    ("u:r:msd_daemon:s0",    "u:object_r:configfs:s0",      "dir",  "search"),
+    ("u:r:msd_daemon:s0",    "u:object_r:configfs:s0",      "file", "write"),
+    ("u:r:su:s0",            "u:r:droidspacesd:s0",         "process", "transition"),
+    ("u:r:magisk:s0",        "u:r:droidspacesd:s0",         "process", "transition"),
+    ("u:r:system_server:s0", "u:r:droidspacesd:s0",         "binder",  "call"),
+    ("u:r:fsck:s0",          "u:r:fsck:s0",                 "capability", "sys_admin"),
+    ("u:r:adbd:s0",          "u:r:adbroot:s0",              "binder", "call"),
 ]
 
 
@@ -206,6 +218,20 @@ CONTEXT_PROBES = [
 ACCESS_PROBES = [
     ("system_server execmem",  "u:r:system_server:s0", "u:r:system_server:s0", "process",    "execmem"),
     ("AOSP su transition",     "u:r:shell:s0",         "u:r:su:s0",            "process",    "transition"),
+    ("fsck sys_admin",         "u:r:fsck:s0",          "u:r:fsck:s0",          "capability", "sys_admin"),
+    ("adbd adbroot binder",    "u:r:adbd:s0",          "u:r:adbroot:s0",       "binder",     "call"),
+    ("magisk binder",          "u:r:magisk:s0",        "u:r:magisk:s0",        "binder",     "call"),
+    ("KSU file read",          "u:r:ksu:s0",           "u:object_r:ksu_file:s0", "file",     "read"),
+    ("LSPosed file read",      "u:r:untrusted_app:s0", "u:object_r:lsposed_file:s0", "file", "read"),
+    ("MSD app connect",        "u:r:msd_app:s0",       "u:r:msd_daemon:s0",    "unix_stream_socket", "connectto"),
+    ("MSD daemon self",        "u:r:msd_daemon:s0",    "u:r:msd_daemon:s0",    "unix_stream_socket", "connectto"),
+    ("MSD selinuxfs read",     "u:r:msd_daemon:s0",    "u:object_r:selinuxfs:s0", "file", "read"),
+    ("MSD configfs search",    "u:r:msd_daemon:s0",    "u:object_r:configfs:s0", "dir", "search"),
+    ("MSD configfs write",     "u:r:msd_daemon:s0",    "u:object_r:configfs:s0", "file", "write"),
+    ("Xposed data read",       "u:r:untrusted_app:s0", "u:object_r:xposed_data:s0", "file", "read"),
+    ("su droidspaces",         "u:r:su:s0",            "u:r:droidspacesd:s0",  "process", "transition"),
+    ("magisk droidspaces",     "u:r:magisk:s0",        "u:r:droidspacesd:s0",  "process", "transition"),
+    ("system_server droidspaces", "u:r:system_server:s0", "u:r:droidspacesd:s0", "binder", "call"),
     ("Magisk rootfs->tmpfs",   "u:object_r:rootfs:s0", "u:object_r:tmpfs:s0",  "filesystem", "associate"),
     ("Magisk kernel->tmpfs",   "u:r:kernel:s0",        "u:object_r:tmpfs:s0",  "fifo_file",  "open"),
     ("KSU kernel->adb_data",   "u:r:kernel:s0",        "u:object_r:adb_data_file:s0", "file", "read"),

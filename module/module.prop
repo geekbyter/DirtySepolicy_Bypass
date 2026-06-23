@@ -1,7 +1,7 @@
 id=dirtysepbypass
-name=DirtySepolicy Bypass (DuckDetector Enhanced)
-version=v4.0.0-got-patch
-versionCode=40000
+name=DirtySepolicy Bypass (Universal)
+version=v5.0.2-targeted
+versionCode=50002
 author=local
-description=Defeats DirtySepolicy v2.0-v2.2 AND DuckDetector dirty sepolicy detection. Extended exact-match probes for shell->su, execmem, MSD, Droidspaces. Added mmap hook for /sys/fs/selinux/status page patching (covers carrier mmap path).
+description=Defeats DirtySepolicy v2.0-v2.2 AND DuckDetector dirty sepolicy detection. v5.0.2: ships static-STL Zygisk libraries and limits hooks to DuckDetector/DirtySepolicy target processes to avoid global app startup risk.
 updateJson=
