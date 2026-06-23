@@ -19,7 +19,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/mman.h>
 #include <sys/utsname.h>
 
 #include <android/log.h>
@@ -511,7 +510,6 @@ static ssize_t (*orig_write)(int, const void *, size_t) = nullptr;
 static ssize_t (*orig_read)(int, void *, size_t) = nullptr;
 static ssize_t (*orig_pread64)(int, void *, size_t, off64_t) = nullptr;
 static int     (*orig_close)(int) = nullptr;
-static void   *(*orig_mmap)(void *, size_t, int, int, int, off_t) = nullptr;
 
 #ifdef DEBUG
 static const char *fdtype_str(FdType t) {
@@ -612,31 +610,6 @@ static int my_close(int fd) {
     if (g_tracked_count > 0)
         untrack_fd(fd);
     return orig_close ? orig_close(fd) : -1;
-}
-
-// ---- mmap hook (covers /sys/fs/selinux/status accessed via mmap) ---------
-// DuckDetector's AppZygotePreload carrier may mmap the status page instead of
-// reading it via read(). DirtySepolicy_Bypass's read() hook won't fire for
-// mmap'd access. Inspired by Admirepowered/selinux_hook's
-// after_sel_mmap_handle_status approach.
-
-static void *my_mmap(void *addr, size_t length, int prot, int flags,
-                     int fd, off_t offset) {
-    void *result = orig_mmap ? orig_mmap(addr, length, prot, flags, fd, offset)
-                             : MAP_FAILED;
-    if (result == MAP_FAILED || result == nullptr) return result;
-
-    if (g_tracked_count > 0 && fd >= 0) {
-        auto *tfd = find_tracked(fd);
-        if (tfd && tfd->type == FD_STATUS && length >= 20 &&
-            (prot & PROT_READ)) {
-            // Patch sequence (offset 4) and policyload (offset 12) in the
-            // mmap'd page to match the clean values we return via read().
-            patch_status(result, (ssize_t)length);
-            LOGD("mmap: patched status page fd=%d addr=%p len=%zu", fd, result, length);
-        }
-    }
-    return result;
 }
 
 // ---- map walking --------------------------------------------------------
