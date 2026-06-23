@@ -641,6 +641,8 @@ static void *my_mmap(void *addr, size_t length, int prot, int flags,
 
 // ---- map walking --------------------------------------------------------
 
+// Only hook libs that are relevant to SELinux detection. Hooking every .so
+// (1000+) causes pltHookCommit to fail on resource-constrained devices.
 static int register_against_all_libs(zygisk::Api *api) {
     FILE *fp = fopen("/proc/self/maps", "re");
     if (!fp) {
@@ -658,33 +660,52 @@ static int register_against_all_libs(zygisk::Api *api) {
         if (len < 4) continue;
         if (strcmp(path + len - 3, ".so") != 0) continue;
 
+        // Only hook libc, libselinux, libandroid_runtime, and the detector's own lib
+        const char *basename = strrchr(path, '/');
+        if (!basename) continue;
+        basename++; // skip '/'
+        if (strcmp(basename, "libc.so") != 0 &&
+            strcmp(basename, "libc_malloc_hooks.so") != 0 &&
+            strcmp(basename, "libselinux.so") != 0 &&
+            strcmp(basename, "libandroid_runtime.so") != 0 &&
+            strstr(basename, "libduckdetector") == nullptr &&
+            strstr(basename, "libdirtysepbypass") == nullptr) {
+            continue;
+        }
+
         struct stat st;
         if (stat(path, &st) != 0) { LOGD("register: stat(%s) failed: %s", path, strerror(errno)); continue; }
 
-        api->pltHookRegister(st.st_dev, st.st_ino, "open",
-                             (void *)my_open,   (void **)&orig_open);
-        api->pltHookRegister(st.st_dev, st.st_ino, "openat",
-                             (void *)my_openat, (void **)&orig_openat);
-        api->pltHookRegister(st.st_dev, st.st_ino, "write",
-                             (void *)my_write,  (void **)&orig_write);
-        api->pltHookRegister(st.st_dev, st.st_ino, "read",
-                             (void *)my_read,   (void **)&orig_read);
-        api->pltHookRegister(st.st_dev, st.st_ino, "pread64",
-                             (void *)my_pread64, (void **)&orig_pread64);
-        api->pltHookRegister(st.st_dev, st.st_ino, "close",
-                             (void *)my_close,  (void **)&orig_close);
-        api->pltHookRegister(st.st_dev, st.st_ino, "mmap",
-                             (void *)my_mmap,   (void **)&orig_mmap);
+        // libc: hook file I/O functions
+        if (strcmp(basename, "libc.so") == 0 ||
+            strcmp(basename, "libc_malloc_hooks.so") == 0) {
+            api->pltHookRegister(st.st_dev, st.st_ino, "open",
+                                 (void *)my_open,   (void **)&orig_open);
+            api->pltHookRegister(st.st_dev, st.st_ino, "openat",
+                                 (void *)my_openat, (void **)&orig_openat);
+            api->pltHookRegister(st.st_dev, st.st_ino, "write",
+                                 (void *)my_write,  (void **)&orig_write);
+            api->pltHookRegister(st.st_dev, st.st_ino, "read",
+                                 (void *)my_read,   (void **)&orig_read);
+            api->pltHookRegister(st.st_dev, st.st_ino, "pread64",
+                                 (void *)my_pread64, (void **)&orig_pread64);
+            api->pltHookRegister(st.st_dev, st.st_ino, "close",
+                                 (void *)my_close,  (void **)&orig_close);
+        }
 
-        api->pltHookRegister(st.st_dev, st.st_ino, "security_compute_av",
-                             (void *)my_security_compute_av,
-                             (void **)&orig_security_compute_av);
-        api->pltHookRegister(st.st_dev, st.st_ino, "security_compute_av_flags",
-                             (void *)my_security_compute_av_flags,
-                             (void **)&orig_security_compute_av_flags);
-        api->pltHookRegister(st.st_dev, st.st_ino, "selinux_check_access",
-                             (void *)my_selinux_check_access,
-                             (void **)&orig_selinux_check_access);
+        // libselinux: hook security_compute_av and selinux_check_access
+        if (strcmp(basename, "libselinux.so") == 0) {
+            api->pltHookRegister(st.st_dev, st.st_ino, "security_compute_av",
+                                 (void *)my_security_compute_av,
+                                 (void **)&orig_security_compute_av);
+            api->pltHookRegister(st.st_dev, st.st_ino, "security_compute_av_flags",
+                                 (void *)my_security_compute_av_flags,
+                                 (void **)&orig_security_compute_av_flags);
+            api->pltHookRegister(st.st_dev, st.st_ino, "selinux_check_access",
+                                 (void *)my_selinux_check_access,
+                                 (void **)&orig_selinux_check_access);
+        }
+
         ++n;
     }
     fclose(fp);
