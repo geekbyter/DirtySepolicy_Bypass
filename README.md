@@ -1,5 +1,20 @@
 # DirtySepolicy Bypass
 
+## It can bypass the SELinux-related checks in the Duck Detector-2026.06.17 version
+
+### before:
+
+<img width="484" height="1105" alt="image" src="https://github.com/user-attachments/assets/8ef7b838-a0fe-4f19-8b9e-ac03f9226053" />
+
+
+### after:
+
+<img width="470" height="894" alt="image" src="https://github.com/user-attachments/assets/4bad2c91-4eb2-4527-a80d-b25db47c66cb" />
+
+
+-----
+
+
 ## Fork Notes
 
 This tree starts from [flipphoneguy/DirtySepolicy_Bypass](https://github.com/flipphoneguy/DirtySepolicy_Bypass)
