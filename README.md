@@ -12,6 +12,11 @@
 <img width="470" height="894" alt="image" src="https://github.com/user-attachments/assets/4bad2c91-4eb2-4527-a80d-b25db47c66cb" />
 
 
+### the remaining two warnings, one from adb/developers and one from a risky app, were easily detected after a few simple steps.
+
+<img width="465" height="1089" alt="image" src="https://github.com/user-attachments/assets/3e359bb6-2dc3-4504-9ca3-f448e4de01f8" />
+
+
 -----
 
 
