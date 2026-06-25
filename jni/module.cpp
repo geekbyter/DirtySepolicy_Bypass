@@ -1,9 +1,11 @@
-// DirtySepolicy Bypass — Zygisk module (v5.0.2-targeted)
+// DirtySepolicy Bypass — Zygisk module (v5.0.3-targeted)
 // Defeats DirtySepolicy v2.0-v2.2 AND DuckDetector dirty sepolicy detection.
 // Uses manual GOT patching (SuKiSu/KernelSU compatible) with Zygisk pltHookCommit fallback.
 // v5.0.2: install only in DuckDetector/DirtySepolicy target processes. Unblock
 //     hidden-context writes so the read hook patches responses instead of
 //     returning EINVAL to the carrier.
+// v5.0.3: sanitize DuckDetector native audit snapshots and app-visible
+//     auditd/logcat AVC side-channel lines.
 
 #include <string.h>
 #include <errno.h>
@@ -382,6 +384,98 @@ static void patch_status(void *buf, ssize_t len) {
     memcpy(p + 12, &pload, sizeof(pload));
 }
 
+// ---- audit/log side-channel text filtering ------------------------------
+
+static bool contains_mem(const char *haystack, size_t haystack_len, const char *needle) {
+    if (!haystack || !needle) return false;
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0 || haystack_len < needle_len) return false;
+    for (size_t i = 0; i <= haystack_len - needle_len; ++i) {
+        if (memcmp(haystack + i, needle, needle_len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool audit_line_is_sensitive(const char *line, size_t len) {
+    const bool auditish =
+        contains_mem(line, len, "auditd") ||
+        contains_mem(line, len, "audit(") ||
+        contains_mem(line, len, "avc:") ||
+        contains_mem(line, len, "type=1400") ||
+        contains_mem(line, len, "SELinux:");
+    if (!auditish)
+        return false;
+
+    if (contains_mem(line, len, "denied") ||
+        contains_mem(line, len, "granted") ||
+        contains_mem(line, len, "permissive="))
+        return true;
+
+    return contains_mem(line, len, "u:r:su:s0") ||
+           contains_mem(line, len, "u:r:magisk:s0") ||
+           contains_mem(line, len, "u:r:ksu:s0") ||
+           contains_mem(line, len, "ksud") ||
+           contains_mem(line, len, "kernelsu") ||
+           contains_mem(line, len, "KernelSU") ||
+           contains_mem(line, len, "magisk") ||
+           contains_mem(line, len, "apatch") ||
+           contains_mem(line, len, "supersu") ||
+           contains_mem(line, len, "/data/adb") ||
+           contains_mem(line, len, "comm=\"su\"") ||
+           contains_mem(line, len, "name=\"su\"");
+}
+
+static ssize_t sanitize_audit_text_buffer(void *buf, ssize_t ret) {
+    if (!buf || ret <= 0) return ret;
+    auto *data = (char *)buf;
+    size_t len = (size_t)ret;
+
+    if (!contains_mem(data, len, "auditd") &&
+        !contains_mem(data, len, "audit(") &&
+        !contains_mem(data, len, "avc:") &&
+        !contains_mem(data, len, "type=1400") &&
+        !contains_mem(data, len, "SELinux:"))
+        return ret;
+
+    char *readp = data;
+    char *writep = data;
+    char *end = data + len;
+    bool changed = false;
+
+    while (readp < end) {
+        char *next = (char *)memchr(readp, '\n', (size_t)(end - readp));
+        size_t line_len = next ? (size_t)(next - readp) : (size_t)(end - readp);
+        bool drop = audit_line_is_sensitive(readp, line_len);
+
+        if (drop) {
+            changed = true;
+        } else {
+            if (writep != readp)
+                memmove(writep, readp, line_len);
+            writep += line_len;
+            if (next)
+                *writep++ = '\n';
+        }
+
+        if (!next)
+            break;
+        readp = next + 1;
+    }
+
+    if (!changed)
+        return ret;
+
+    if (writep == data) {
+        data[0] = '\n';
+        LOGD("audit text read: suppressed all AVC/audit lines");
+        return 1;
+    }
+
+    LOGD("audit text read: filtered %zd -> %zd bytes", ret, (ssize_t)(writep - data));
+    return (ssize_t)(writep - data);
+}
+
 // ---- libselinux ABI (defense-in-depth hooks) ----------------------------
 
 struct av_decision {
@@ -609,16 +703,19 @@ static ssize_t my___write_chk(int fd, const void *buf, size_t count, size_t bufs
 }
 
 static ssize_t patch_fd_read(int fd, void *buf, ssize_t ret, size_t count) {
-    if (ret <= 0 || g_tracked_count == 0) return ret;
-    auto *tfd = find_tracked(fd);
-    if (!tfd) return ret;
-    if (tfd->type == FD_ACCESS && tfd->has_query) {
-        ret = patch_access_response(tfd, (char *)buf, ret, count);
-        tfd->has_query = false;
-    } else if (tfd->type == FD_STATUS) {
-        patch_status(buf, ret);
+    if (ret <= 0) return ret;
+    if (g_tracked_count > 0) {
+        auto *tfd = find_tracked(fd);
+        if (tfd) {
+            if (tfd->type == FD_ACCESS && tfd->has_query) {
+                ret = patch_access_response(tfd, (char *)buf, ret, count);
+                tfd->has_query = false;
+            } else if (tfd->type == FD_STATUS) {
+                patch_status(buf, ret);
+            }
+        }
     }
-    return ret;
+    return sanitize_audit_text_buffer(buf, ret);
 }
 
 static ssize_t my_read(int fd, void *buf, size_t count) {
@@ -702,7 +799,9 @@ static size_t my_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     if (ret && size && stream) {
         int fd = fileno(stream);
         size_t bytes = ret * size;
-        (void)patch_fd_read(fd, ptr, (ssize_t)bytes, bytes);
+        ssize_t patched = patch_fd_read(fd, ptr, (ssize_t)bytes, bytes);
+        if (patched >= 0 && (size_t)patched < bytes)
+            memset((char *)ptr + patched, 0, bytes - (size_t)patched);
     }
     return ret;
 }
@@ -819,25 +918,92 @@ static void *my_android_dlopen_ext(const char *filename, int flags, const void *
 static jstring (*orig_NewStringUTF)(JNIEnv *, const char *) = nullptr;
 static bool g_jni_hooked = false;
 
+static bool patch_bool_key_false(char *text, const char *key) {
+    char pattern[64];
+    int pattern_len = snprintf(pattern, sizeof(pattern), "%s=", key);
+    if (pattern_len <= 0 || (size_t)pattern_len >= sizeof(pattern))
+        return false;
+
+    bool changed = false;
+    for (char *line = text; line && *line;) {
+        char *next = strchr(line, '\n');
+        if (strncmp(line, pattern, (size_t)pattern_len) == 0) {
+            char *value = line + pattern_len;
+            if (*value == '1' ||
+                strncmp(value, "true", 4) == 0 ||
+                strncmp(value, "TRUE", 4) == 0 ||
+                strncmp(value, "True", 4) == 0) {
+                *value = '0';
+                changed = true;
+            }
+        }
+        line = next ? next + 1 : nullptr;
+    }
+    return changed;
+}
+
+static bool remove_lines_with_prefix(char *text, const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    char *readp = text;
+    char *writep = text;
+    bool changed = false;
+
+    while (*readp) {
+        char *next = strchr(readp, '\n');
+        size_t line_len = next ? (size_t)(next - readp) : strlen(readp);
+        bool drop = line_len >= prefix_len && strncmp(readp, prefix, prefix_len) == 0;
+
+        if (drop) {
+            changed = true;
+        } else {
+            if (writep != readp)
+                memmove(writep, readp, line_len);
+            writep += line_len;
+            if (next)
+                *writep++ = '\n';
+        }
+
+        if (!next)
+            break;
+        readp = next + 1;
+    }
+
+    if (changed)
+        *writep = '\0';
+    return changed;
+}
+
 static char *sanitize_payload(const char *utf) {
     if (!utf) return nullptr;
-    if (!strstr(utf, "DIRTY_POLICY_") && !strstr(utf, "JAVA_DIRTY_POLICY_"))
+    const bool has_dirty_payload =
+        strstr(utf, "DIRTY_POLICY_") || strstr(utf, "JAVA_DIRTY_POLICY_");
+    const bool has_audit_payload =
+        strstr(utf, "DENIAL_OBSERVED=") || strstr(utf, "ALLOW_OBSERVED=") ||
+        strstr(utf, "PROBE_MARKER=") || strstr(utf, "CALLBACK_INSTALLED=");
+    if (!has_dirty_payload && !has_audit_payload)
         return nullptr;
 
     char *copy = strdup(utf);
     if (!copy) return nullptr;
 
     bool changed = false;
-    const char needle[] = "_ALLOWED=1";
-    const size_t needle_len = sizeof(needle) - 1;
-    for (char *p = strstr(copy, needle); p; p = strstr(p + needle_len, needle)) {
-        char *line = p;
-        while (line > copy && line[-1] != '\n') --line;
-        if (strncmp(line, "DIRTY_POLICY_", 13) == 0 ||
-            strncmp(line, "JAVA_DIRTY_POLICY_", 18) == 0) {
-            p[needle_len - 1] = '0';
-            changed = true;
+    if (has_dirty_payload) {
+        const char needle[] = "_ALLOWED=1";
+        const size_t needle_len = sizeof(needle) - 1;
+        for (char *p = strstr(copy, needle); p; p = strstr(p + needle_len, needle)) {
+            char *line = p;
+            while (line > copy && line[-1] != '\n') --line;
+            if (strncmp(line, "DIRTY_POLICY_", 13) == 0 ||
+                strncmp(line, "JAVA_DIRTY_POLICY_", 18) == 0) {
+                p[needle_len - 1] = '0';
+                changed = true;
+            }
         }
+    }
+    if (has_audit_payload) {
+        changed |= patch_bool_key_false(copy, "DENIAL_OBSERVED");
+        changed |= patch_bool_key_false(copy, "ALLOW_OBSERVED");
+        changed |= remove_lines_with_prefix(copy, "LINE=");
     }
 
     if (!changed) {
@@ -851,7 +1017,7 @@ static jstring my_NewStringUTF(JNIEnv *env, const char *utf) {
     if (!orig_NewStringUTF) return nullptr;
     char *patched = sanitize_payload(utf);
     if (patched) {
-        LOGD("NewStringUTF: sanitized dirty policy payload");
+        LOGD("NewStringUTF: sanitized detector payload");
         jstring out = orig_NewStringUTF(env, patched);
         free(patched);
         return out;

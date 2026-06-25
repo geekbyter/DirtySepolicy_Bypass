@@ -1,86 +1,17 @@
 # DirtySepolicy Bypass
 
-## It can bypass the SELinux-related checks in the Duck Detector-2026.06.17 version
-
-### before:
-
-<img width="484" height="1105" alt="image" src="https://github.com/user-attachments/assets/8ef7b838-a0fe-4f19-8b9e-ac03f9226053" />
-
-
-### after:
-
-<img width="470" height="894" alt="image" src="https://github.com/user-attachments/assets/4bad2c91-4eb2-4527-a80d-b25db47c66cb" />
-
-
-### the remaining two warnings, one from adb/developers and one from a risky app, were easily detected after a few simple steps.
-
-<img width="465" height="1089" alt="image" src="https://github.com/user-attachments/assets/3e359bb6-2dc3-4504-9ca3-f448e4de01f8" />
-
-
------
-
-
-## Fork Notes
+## Split Notes
 
 This tree starts from [flipphoneguy/DirtySepolicy_Bypass](https://github.com/flipphoneguy/DirtySepolicy_Bypass)
-and keeps the original Zygisk implementation as a fallback/diagnostic path.
-The current working branch adds a SuKiSU/GKI-oriented KernelPatch path:
+and now keeps only the Zygisk implementation and userspace audit helper here.
 
-- `kpm/dirtyduck/`: a kernel-side SELinux access/status/context/procattr filter
-  adapted for DirtySepolicy and DuckDetector probes.
-- `kpm/smoke/`: a no-op KPM used to verify that KPM loading is safe before
-  testing the SELinux hook.
-- `module-kpm/`: a safe ordinary loader module; it does not autoload KPM unless
-  explicitly enabled.
-- `tools/build_kpm_windows.ps1` and `tools/package_kpm_loader.ps1`: Windows
-  build/package helpers for the KPM workflow.
+The KernelPatch/SuKiSU KPM implementation has been split into
+`../dirtysepolicy_kpm`, including the `dirtyduck` source, smoke-test KPM,
+GitHub Actions cloud build workflow, and KPM recovery notes.
 
-Compared with [Admirepowered/selinux_hook](https://github.com/Admirepowered/selinux_hook),
-this branch uses that project as the kernel-hook reference but retargets the
-logic from generic APatch dirty-rule hiding to DirtySepolicy/DuckDetector
-detection surfaces.  It keeps a clean-policy baseline, rewrites SELinux
-access/status/context/procattr query results, adds DuckDetector-specific probe
-patterns, prefers the `write_op` table on SuKiSU/GKI, and disables slow
-compiler-suffix symbol walking by default to reduce KPM load time.
-
-Reference projects:
+Reference project:
 
 - [flipphoneguy/DirtySepolicy_Bypass](https://github.com/flipphoneguy/DirtySepolicy_Bypass)
-- [Admirepowered/selinux_hook](https://github.com/Admirepowered/selinux_hook)
-
-## Current SuKiSU/GKI Direction
-
-For the current SuKiSU/GKI environment, the recommended path is **not** the
-global Zygisk module path.  DuckDetector's dirty-policy probe is an app_zygote
-carrier that talks directly to `/sys/fs/selinux/access`, so the stable approach
-is a KernelPatch KPM:
-
-- `kpm/smoke/` builds a no-op KPM used only to verify KPM loading.
-- `kpm/dirtyduck/` builds the SELinux access/status filter KPM.
-- `module-kpm/` is a safe ordinary loader module.  It does **not** autoload KPM
-  unless `/data/adb/dirtysepolicy_kpm/enable-autoload` exists.
-
-Build locally on Windows with:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\build_kpm_windows.ps1 -Target all
-powershell -ExecutionPolicy Bypass -File .\tools\package_kpm_loader.ps1
-```
-
-Test order:
-
-1. Load `dirtyduck_smoke.kpm` manually from the manager.
-2. Check kernel logs for `[dirtyduck_smoke] init`.
-3. Load `dirtyduck_selinux.kpm` manually.
-4. Only after manual loading is stable, enable autoload.
-
-Emergency disable:
-
-```sh
-su -c 'touch /data/adb/dirtysepolicy_kpm/disable; rm -f /data/adb/dirtysepolicy_kpm/enable-autoload'
-```
-
-The original Zygisk implementation is kept as a fallback/diagnostic path only.
 
 <div align="center">
 

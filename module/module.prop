@@ -1,7 +1,7 @@
 id=dirtysepbypass
 name=DirtySepolicy Bypass (Universal)
-version=v5.0.2-targeted
-versionCode=50002
+version=v5.0.3-targeted
+versionCode=50003
 author=local
-description=Defeats DirtySepolicy v2.0-v2.2 AND DuckDetector dirty sepolicy detection. v5.0.2: ships static-STL Zygisk libraries and limits hooks to DuckDetector/DirtySepolicy target processes to avoid global app startup risk.
+description=Defeats DirtySepolicy v2.0-v2.2 AND DuckDetector dirty sepolicy/audit exposure detection. v5.0.3: adds DuckDetector audit snapshot and auditd/logcat AVC side-channel filtering in target processes.
 updateJson=
